@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "verifiers-ucloud"
+version = "0.1.0"
+description = "UCloud sandbox runtime and relay interception for verifiers"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "ucloud-sandboxes-sdk[async]>=0.4.1,<0.5",
+    "verifiers>=0.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9.1",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.16",
+    "ty>=0.0.63",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/verifiers_ucloud"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.uv.sources]
+ucloud-sandboxes-sdk = { path = "../ucloud-sandboxes-sdk", editable = true }
+verifiers = { path = "../verifiers", editable = true }
+
+[tool.uv.exclude-newer-package]
+prime-pydantic-config = false
+prime-sandboxes = false
+prime-tunnel = false
+renderers = false

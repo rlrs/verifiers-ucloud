@@ -1,0 +1,29 @@
+# verifiers-ucloud
+
+UCloud sandbox runtime and relay-backed interception for verifiers v1.
+
+The package exports both integrations from `verifiers_ucloud`. Once installed,
+verifiers discovers them from the normal config types:
+
+```toml
+[env.agent.runtime]
+type = "ucloud"
+image = "python:3.11-slim"
+cpu = 2
+memory = 4
+
+[env.interception]
+type = "ucloud"
+```
+
+Set `UCLOUD_SANDBOX_API_URL` and, when required,
+`UCLOUD_SANDBOX_API_TOKEN` for the sandbox gateway. Set `UCLOUD_RELAY_URL` and,
+when required, `UCLOUD_RELAY_WORKER_TOKEN` for relay interception.
+
+For local development beside the `verifiers` and `ucloud-sandboxes-sdk`
+repositories:
+
+```console
+uv sync
+uv run pytest
+```
