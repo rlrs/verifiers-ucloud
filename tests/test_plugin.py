@@ -21,7 +21,6 @@ from verifiers_ucloud import (
     UCloudRuntime,
     UCloudRuntimeConfig,
 )
-from verifiers_ucloud.interception import _registration_token
 
 
 def test_verifiers_discovers_package_exports() -> None:
@@ -40,19 +39,49 @@ def test_verifiers_discovers_package_exports() -> None:
     )
 
 
-def test_registration_token_is_explicitly_validated() -> None:
-    assert (
-        _registration_token({"rollout": {"registration_token": "secret"}}) == "secret"
-    )
-    with pytest.raises(RuntimeError, match="access token"):
-        _registration_token({})
-
-
 @dataclass
 class _Result:
     exit_code: int | None = 0
     stdout: str = "ok"
     stderr: str = ""
+
+
+class _ProcessStdin:
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        pass
+
+
+class _ProcessHandle:
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+
+    async def terminate(self) -> None:
+        self.terminated = True
+
+    async def kill(self) -> None:
+        self.killed = True
+
+
+class _Process:
+    def __init__(self) -> None:
+        self.stdin = _ProcessStdin()
+        self.handle = _ProcessHandle()
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.stdout.feed_data(b"stdout")
+        self.stdout.feed_eof()
+        self.stderr.feed_data(b"stderr")
+        self.stderr.feed_eof()
+
+    async def wait(self) -> int:
+        return 7
 
 
 class _SandboxClient:
@@ -61,23 +90,32 @@ class _SandboxClient:
     def __init__(self, base_url: str, **kwargs) -> None:
         self.base_url = base_url
         self.kwargs = kwargs
-        self.created: dict | None = None
+        self.created = None
+        self.create_kwargs: dict = {}
         self.execs: list[tuple[str, list[str], dict]] = []
+        self.processes: list[tuple[str, list[str], dict, _Process]] = []
         self.uploads: list[tuple[str, str, bytes]] = []
         self.deleted: list[str] = []
         self.closed = False
         self.instances.append(self)
 
-    async def create_sandbox(self, **kwargs):
-        self.created = kwargs
-        return SimpleNamespace(id=kwargs["id"])
+    @classmethod
+    def from_env(cls, *, timeout_seconds: float):
+        return cls("https://gateway.example", timeout_seconds=timeout_seconds)
 
-    async def get_sandbox(self, sandbox_id: str):
-        return None
+    async def create_sandbox(self, spec, **kwargs):
+        self.created = spec
+        self.create_kwargs = kwargs
+        return SimpleNamespace(id=spec.id)
 
     async def exec(self, sandbox_id: str, command: list[str], **kwargs):
         self.execs.append((sandbox_id, command, kwargs))
         return _Result()
+
+    async def open_process(self, sandbox_id: str, command: list[str], **kwargs):
+        process = _Process()
+        self.processes.append((sandbox_id, command, kwargs, process))
+        return process
 
     async def download_file(self, sandbox_id: str, path: str) -> bytes:
         return f"{sandbox_id}:{path}".encode()
@@ -115,29 +153,52 @@ class _InterceptionServer:
         self.unregistered.append((model_secret, state_secret))
 
 
+class _RelaySession:
+    def __init__(self, client: _RelayClient, rollout_id: str, **kwargs) -> None:
+        self.client = client
+        self.rollout_id = rollout_id
+        self.kwargs = kwargs
+        self.base_url = f"{client.relay_url}/managed/{rollout_id}"
+        self.run_kwargs: dict | None = None
+
+    async def __aenter__(self):
+        self.client.registered.append(self.rollout_id)
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self.client.unregistered.append(self.rollout_id)
+
+    async def run(self, **kwargs) -> None:
+        self.run_kwargs = kwargs
+        await kwargs["cancel"].wait()
+
+
 class _RelayClient:
     instances: ClassVar[list[_RelayClient]] = []
 
     def __init__(self, relay_url: str, **kwargs) -> None:
-        self.relay_url = relay_url
+        self.relay_url = relay_url.rstrip("/")
         self.kwargs = kwargs
         self.registered: list[str] = []
         self.unregistered: list[str] = []
+        self.sessions: list[_RelaySession] = []
         self.closed = False
         self.instances.append(self)
 
-    async def register_tunnel(self, tunnel_id: str, **kwargs) -> dict:
-        self.registered.append(tunnel_id)
-        return {"rollout": {"registration_token": "access/token"}}
+    @classmethod
+    def from_env(cls, *, env: dict[str, str], **kwargs):
+        return cls(env["UCLOUD_RELAY_URL"], **kwargs)
 
-    async def unregister_tunnel(self, tunnel_id: str) -> None:
-        self.unregistered.append(tunnel_id)
+    async def __aenter__(self):
+        return self
 
-    async def poll(self, tunnel_id: str, **kwargs):
-        await asyncio.Event().wait()
-
-    async def close(self) -> None:
+    async def __aexit__(self, *exc) -> None:
         self.closed = True
+
+    def rollout_session(self, rollout_id: str, **kwargs) -> _RelaySession:
+        session = _RelaySession(self, rollout_id, **kwargs)
+        self.sessions.append(session)
+        return session
 
 
 @pytest.mark.asyncio
@@ -145,7 +206,7 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
     import verifiers_ucloud.runtime as runtime_module
 
     _SandboxClient.instances.clear()
-    monkeypatch.setenv("UCLOUD_SANDBOX_API_URL", "https://gateway.example")
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
     monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
 
     runtime = UCloudRuntime(
@@ -156,15 +217,34 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
     client = _SandboxClient.instances[-1]
 
     assert runtime.info.id == "sandbox-1"
+    assert runtime.supports_live_processes
     assert client.created is not None
-    assert client.created["cpus"] == 2
-    assert client.created["memory_mb"] == 4096
-    assert client.created["disk_mb"] == 8192
-    assert client.created["env"] == {"RUNTIME": "yes"}
+    spec = client.created.to_dict()
+    assert spec["profile"] == "linux_host"
+    assert spec["security"] is None
+    assert spec["filesystem"] is None
+    assert spec["command"] == []
+    assert spec["cpus"] == 2
+    assert spec["memory_mb"] == 4096
+    assert spec["disk_mb"] == 8192
+    assert spec["env"] == {"RUNTIME": "yes"}
+    assert client.create_kwargs == {"request_timeout_seconds": 900.0}
 
     result = await runtime.run(["echo", "ok"], {"CALL": "yes"})
     assert result.stdout == "ok"
     assert client.execs[-1][2]["env"] == {"RUNTIME": "yes", "CALL": "yes"}
+
+    process = await runtime.open_process(["agent"], {"PROCESS": "yes"})
+    await process.write(b"request")
+    assert b"".join([chunk async for chunk in process.stdout]) == b"stdout"
+    assert b"".join([chunk async for chunk in process.stderr]) == b"stderr"
+    assert await process.wait() == 7
+    await process.terminate()
+    await process.kill()
+    sdk_process = client.processes[-1][3]
+    assert sdk_process.stdin.writes == [b"request"]
+    assert sdk_process.handle.terminated
+    assert sdk_process.handle.killed
 
     await runtime.write("result.txt", b"done")
     assert client.uploads[-1] == ("sandbox-1", "/app/result.txt", b"done")
@@ -176,7 +256,7 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_interception_registers_relay_slot_and_cleans_up(monkeypatch) -> None:
+async def test_interception_uses_managed_relay_session(monkeypatch) -> None:
     import verifiers_ucloud.interception as interception_module
 
     _InterceptionServer.instances.clear()
@@ -190,21 +270,24 @@ async def test_interception_registers_relay_slot_and_cleans_up(monkeypatch) -> N
         state_service_secrets=("shared-secret",),
     )
     await interception.start()
-    session = cast(
-        RolloutSession, SimpleNamespace(trace=SimpleNamespace(id="trace /1"))
-    )
+    session = cast(RolloutSession, SimpleNamespace(trace=SimpleNamespace(id="trace-1")))
 
     async with interception.acquire(session) as slot:
         assert slot == (
-            "https://relay.example/tunnels/trace%20%2F1/_relay/access%2Ftoken",
+            "https://relay.example/managed/trace-1",
             "model-secret",
             "state-secret",
         )
 
     relay = _RelayClient.instances[-1]
+    relay_session = relay.sessions[-1]
     server = _InterceptionServer.instances[-1]
-    assert relay.registered == ["trace /1"]
-    assert relay.unregistered == ["trace /1"]
+    assert relay.registered == ["trace-1"]
+    assert relay.unregistered == ["trace-1"]
+    assert relay_session.kwargs["metadata"] == {"consumer": "verifiers"}
+    assert relay_session.run_kwargs is not None
+    assert relay_session.run_kwargs["upstream_base_url"] == server.base_url
+    assert relay_session.run_kwargs["lease_seconds"] == 900.0
     assert server.unregistered == [("model-secret", "state-secret")]
 
     await interception.stop()

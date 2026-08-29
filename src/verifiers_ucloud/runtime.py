@@ -5,17 +5,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import shlex
+from collections.abc import AsyncIterator
 from pathlib import PurePosixPath
 from typing import ClassVar, Literal
 
 from pydantic import Field
 from ucloud_sandboxes_sdk import (
     AsyncSandboxClient,
+    AsyncSandboxProcess,
     Image,
-    SandboxApiError,
     SandboxClient,
+    SandboxSpec,
 )
 from verifiers.v1.configs.runtime import BaseRuntimeConfig
 from verifiers.v1.errors import SandboxError
@@ -23,6 +24,7 @@ from verifiers.v1.runtimes.base import (
     BaseRuntimeInfo,
     ProgramResult,
     Runtime,
+    RuntimeProcess,
     parse_gpu,
 )
 from verifiers.v1.runtimes.limiters import creation_limiter
@@ -31,7 +33,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
 _DEFAULT_CREATE_TIMEOUT_SECONDS = 900.0
-_TRANSIENT_STATUS_CODES = {502, 503, 504}
 
 
 class UCloudRuntimeConfig(BaseRuntimeConfig):
@@ -56,22 +57,31 @@ class UCloudRuntimeInfo(UCloudRuntimeConfig, BaseRuntimeInfo):
     pass
 
 
-def _sandbox_api_url() -> str:
-    value = next(
-        (
-            os.environ[name]
-            for name in (
-                "UCLOUD_SANDBOX_API_URL",
-                "UCLOUD_SANDBOX_URL",
-                "UCLOUD_SANDBOX_BASE_URL",
-            )
-            if os.environ.get(name)
-        ),
-        None,
-    )
-    if value is None:
-        raise RuntimeError("set UCLOUD_SANDBOX_API_URL to the UCloud sandbox gateway")
-    return value
+async def _read_stream(reader: asyncio.StreamReader) -> AsyncIterator[bytes]:
+    while chunk := await reader.read(64 * 1024):
+        yield chunk
+
+
+class UCloudProcess(RuntimeProcess):
+    """Adapt an SDK process to the verifiers live-process contract."""
+
+    def __init__(self, process: AsyncSandboxProcess) -> None:
+        self._process = process
+        self.stdout = _read_stream(process.stdout)
+        self.stderr = _read_stream(process.stderr)
+
+    async def write(self, data: bytes) -> None:
+        self._process.stdin.write(data)
+        await self._process.stdin.drain()
+
+    async def wait(self) -> int:
+        return await self._process.wait()
+
+    async def terminate(self) -> None:
+        await self._process.handle.terminate()
+
+    async def kill(self) -> None:
+        await self._process.handle.kill()
 
 
 class UCloudRuntime(Runtime):
@@ -98,70 +108,36 @@ class UCloudRuntime(Runtime):
             raise SandboxError("ucloud runtime currently supports CPU-only sandboxes")
 
         try:
-            self._client = AsyncSandboxClient(
-                _sandbox_api_url(),
-                api_token=os.environ.get("UCLOUD_SANDBOX_API_TOKEN"),
-                timeout_seconds=self.config.request_timeout_seconds,
+            self._client = AsyncSandboxClient.from_env(
+                timeout_seconds=self.config.request_timeout_seconds
+            )
+            spec = SandboxSpec.benchmark(
+                id=self.name,
+                image=Image.from_registry(self.config.image),
+                env=self.env,
+                working_dir=self.config.workdir,
+                cpus=self.config.cpu,
+                memory_mb=round(self.config.memory * 1024),
+                disk_mb=round(self.config.disk * 1024),
+                network="bridge" if self.config.network_access else "none",
+                ttl_seconds=self.config.ttl_seconds,
+                labels=self.config.labels,
             )
             async with (
                 creation_limiter(self.config.creates_per_sec, "ucloud-sandbox")
                 or contextlib.nullcontext()
             ):
-                handle = await self._create()
-            self.info.id = handle.id
-            await self._wait_until_ready()
-        except Exception as exc:
-            raise SandboxError(f"ucloud sandbox provisioning failed: {exc}") from exc
-
-    async def _create(self):
-        client = self._client_or_raise()
-        deadline = (
-            asyncio.get_running_loop().time() + self.config.create_timeout_seconds
-        )
-        while True:
-            try:
-                return await client.create_sandbox(
-                    id=self.name,
-                    image=Image.from_registry(self.config.image),
-                    command=["tail", "-f", "/dev/null"],
-                    env=self.env,
-                    working_dir=self.config.workdir,
-                    cpus=self.config.cpu,
-                    memory_mb=round(self.config.memory * 1024),
-                    disk_mb=round(self.config.disk * 1024),
-                    network="bridge" if self.config.network_access else "none",
-                    ttl_seconds=self.config.ttl_seconds,
-                    labels=self.config.labels,
-                    request_timeout_seconds=self.config.request_timeout_seconds,
+                handle = await self._client.create_sandbox(
+                    spec,
+                    request_timeout_seconds=self.config.create_timeout_seconds,
                 )
-            except Exception as exc:
-                if not _transient(exc) or asyncio.get_running_loop().time() >= deadline:
-                    raise
-                # Creation is keyed by a stable sandbox id. If the response was
-                # lost, accept the existing sandbox instead of duplicating it.
+            self.info.id = handle.id
+        except Exception as exc:
+            client, self._client = self._client, None
+            if client is not None:
                 with contextlib.suppress(Exception):
-                    if await client.get_sandbox(self.name) is not None:
-                        from ucloud_sandboxes_sdk import AsyncSandboxHandle
-
-                        return AsyncSandboxHandle(client, self.name)
-                await asyncio.sleep(1)
-
-    async def _wait_until_ready(self) -> None:
-        deadline = (
-            asyncio.get_running_loop().time() + self.config.create_timeout_seconds
-        )
-        while True:
-            try:
-                result = await self.run(["mkdir", "-p", self.config.workdir], {})
-                if result.exit_code == 0:
-                    return
-                detail = result.stderr.strip() or f"exit code {result.exit_code}"
-                exc: Exception = RuntimeError(detail)
-            except Exception as error:
-                exc = error
-            if asyncio.get_running_loop().time() >= deadline:
-                raise exc
-            await asyncio.sleep(1)
+                    await client.close()
+            raise SandboxError(f"ucloud sandbox provisioning failed: {exc}") from exc
 
     async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         if self.info.id is None:
@@ -180,6 +156,22 @@ class UCloudRuntime(Runtime):
             stdout=result.stdout,
             stderr=result.stderr,
         )
+
+    async def open_process(
+        self, argv: list[str], env: dict[str, str]
+    ) -> RuntimeProcess:
+        if self.info.id is None:
+            raise SandboxError("ucloud sandbox has no id")
+        try:
+            process = await self._client_or_raise().open_process(
+                self.info.id,
+                argv,
+                env=self.process_env(env),
+                working_dir=self.config.workdir,
+            )
+        except Exception as exc:
+            raise SandboxError(f"ucloud live process failed to start: {exc}") from exc
+        return UCloudProcess(process)
 
     async def run_background(
         self, argv: list[str], env: dict[str, str], log: str
@@ -224,13 +216,10 @@ class UCloudRuntime(Runtime):
         if self._client is None or sandbox_id is None:
             return
         try:
-            client = SandboxClient(
-                _sandbox_api_url(),
-                api_token=os.environ.get("UCLOUD_SANDBOX_API_TOKEN"),
-                timeout_seconds=self.config.request_timeout_seconds,
+            client = SandboxClient.from_env(
+                timeout_seconds=self.config.request_timeout_seconds
             )
-            with contextlib.suppress(Exception):
-                client.delete_sandbox(sandbox_id)
+            client.delete_sandbox(sandbox_id)
         except Exception:
             logger.exception("ucloud synchronous cleanup failed for %s", sandbox_id)
         self._client = None
@@ -249,9 +238,3 @@ class UCloudRuntime(Runtime):
         self._client = None
         with contextlib.suppress(Exception):
             await client.close()
-
-
-def _transient(exc: Exception) -> bool:
-    return isinstance(exc, (TimeoutError, OSError)) or (
-        isinstance(exc, SandboxApiError) and exc.status_code in _TRANSIENT_STATUS_CODES
-    )

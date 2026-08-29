@@ -16,12 +16,13 @@ memory = 4
 type = "ucloud"
 ```
 
-Set `UCLOUD_SANDBOX_API_URL` and, when required,
+`image` is only the runtime default; each environment can select its own image.
+
+Set `UCLOUD_SANDBOX_URL` and, when required,
 `UCLOUD_SANDBOX_API_TOKEN` for the sandbox gateway. Set `UCLOUD_RELAY_URL` and,
 when required, `UCLOUD_RELAY_WORKER_TOKEN` for relay interception.
 
-For local development beside the `verifiers` and `ucloud-sandboxes-sdk`
-repositories:
+For local development beside the `verifiers` repository:
 
 ```console
 uv sync
