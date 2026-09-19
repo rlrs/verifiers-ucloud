@@ -28,3 +28,7 @@ For local development beside the `verifiers` repository:
 uv sync
 uv run pytest
 ```
+
+The pinned SDK 0.4.21 includes startup/restore backpressure handling and separate
+relay connection pools for polling, upstream calls, and reply/lease control.
+After updating this checkout, run `uv sync` to install the tested SDK.

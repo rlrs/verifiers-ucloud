@@ -11,7 +11,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-08-22T18:31:36.812481Z"
+exclude-newer = "2026-09-12T06:32:35.07863Z"
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
@@ -2445,10 +2445,10 @@ wheels = [
 
 [[package]]
 name = "ucloud-sandboxes-sdk"
-version = "0.4.15"
-source = { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.15/ucloud_sandboxes_sdk-0.4.15-py3-none-any.whl" }
+version = "0.4.21"
+source = { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.21/ucloud_sandboxes_sdk-0.4.21-py3-none-any.whl" }
 wheels = [
-    { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.15/ucloud_sandboxes_sdk-0.4.15-py3-none-any.whl", hash = "sha256:9cf41c21bf3eac27b91d9109cd28570abf35964c389c080c6c7d150c13c7f6e5" },
+    { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.21/ucloud_sandboxes_sdk-0.4.21-py3-none-any.whl", hash = "sha256:9a459bb0c50edf8efb49b23d9083f603db73a58c24e64a7359651d7b1eb9cf6b" },
 ]
 
 [package.optional-dependencies]
@@ -2642,7 +2642,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ucloud-sandboxes-sdk", extras = ["async"], url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.15/ucloud_sandboxes_sdk-0.4.15-py3-none-any.whl" },
+    { name = "ucloud-sandboxes-sdk", extras = ["async"], url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.21/ucloud_sandboxes_sdk-0.4.21-py3-none-any.whl" },
     { name = "verifiers", editable = "../verifiers" },
 ]
 
