@@ -15,6 +15,8 @@ from verifiers.v1.interception.base import BaseInterceptionConfig, Interception,
 from verifiers.v1.interception.server import InterceptionServer
 from verifiers.v1.session import RolloutSession
 
+from ._resources import ensure_file_descriptor_capacity
+
 
 class UCloudInterceptionConfig(BaseInterceptionConfig):
     """Expose the local interception server through the polling relay."""
@@ -46,6 +48,7 @@ class UCloudInterception(Interception):
         self.worker_id = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 
     async def start(self) -> None:
+        ensure_file_descriptor_capacity()
         await self.stack.enter_async_context(self.server)
         env = dict(os.environ)
         if self.config.relay_url is not None:

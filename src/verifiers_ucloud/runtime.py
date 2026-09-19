@@ -29,6 +29,8 @@ from verifiers.v1.runtimes.base import (
 )
 from verifiers.v1.runtimes.limiters import creation_limiter
 
+from ._resources import ensure_file_descriptor_capacity
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
@@ -103,6 +105,7 @@ class UCloudRuntime(Runtime):
         return self._client
 
     async def start(self) -> None:
+        ensure_file_descriptor_capacity()
         gpu_type, gpu_count = parse_gpu(self.config.gpu)
         if gpu_type or gpu_count:
             raise SandboxError("ucloud runtime currently supports CPU-only sandboxes")
