@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.23/ucloud_sandboxes_sdk-0.4.23-py3-none-any.whl",
+    "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.26/ucloud_sandboxes_sdk-0.4.26-py3-none-any.whl",
     "verifiers>=0.2.0",
 ]
 

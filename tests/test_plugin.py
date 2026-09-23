@@ -265,7 +265,11 @@ async def test_interception_uses_managed_relay_session(monkeypatch) -> None:
     monkeypatch.setattr(interception_module, "AsyncRelayWorkerClient", _RelayClient)
 
     interception = UCloudInterception(
-        UCloudInterceptionConfig(relay_url="https://relay.example/"),
+        UCloudInterceptionConfig(
+            relay_url="https://relay.example/",
+            max_inflight_requests=17,
+            forward_timeout_seconds=123.0,
+        ),
         requires_tunnel=True,
         state_service_secrets=("shared-secret",),
     )
@@ -280,6 +284,8 @@ async def test_interception_uses_managed_relay_session(monkeypatch) -> None:
         )
 
     relay = _RelayClient.instances[-1]
+    assert relay.kwargs["max_inflight_requests"] == 17
+    assert relay.kwargs["forward_timeout_seconds"] == 123.0
     relay_session = relay.sessions[-1]
     server = _InterceptionServer.instances[-1]
     assert relay.registered == ["trace-1"]
@@ -293,3 +299,67 @@ async def test_interception_uses_managed_relay_session(monkeypatch) -> None:
     await interception.stop()
     assert relay.closed
     assert server.closed
+
+
+def test_interception_request_budget_must_be_positive() -> None:
+    with pytest.raises(ValueError):
+        UCloudInterceptionConfig(max_inflight_requests=0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["normal", "cancel", "failure", "hint_failure"])
+async def test_resource_phase_hints_are_optional_fenced_and_non_authoritative(
+    monkeypatch, outcome
+):
+    import verifiers_ucloud.interception as module
+
+    monkeypatch.setattr(module, "InterceptionServer", _InterceptionServer)
+    monkeypatch.setattr(module, "AsyncRelayWorkerClient", _RelayClient)
+    monkeypatch.setattr(_RelaySession, "registration_token", "a" * 32, raising=False)
+    calls = []
+
+    async def update(self, rollout_id, **kwargs):
+        calls.append((rollout_id, kwargs))
+        if outcome == "hint_failure":
+            raise TimeoutError("unavailable")
+        return {"accepted": True}
+
+    monkeypatch.setattr(_RelayClient, "update_resource_phase", update, raising=False)
+    interception = UCloudInterception(
+        UCloudInterceptionConfig(
+            relay_url="https://relay.example", resource_phase_hints=True
+        )
+    )
+    await interception.start()
+    session = cast(
+        RolloutSession, SimpleNamespace(trace=SimpleNamespace(id="phase-run"))
+    )
+
+    async def exercise():
+        async with interception.acquire(session):
+            await interception.report_resource_phase(
+                "phase-run", "model_wait", expected_remaining_wait_seconds=20
+            )
+            if outcome == "cancel":
+                raise asyncio.CancelledError()
+            if outcome == "failure":
+                raise RuntimeError("tool failed")
+
+    try:
+        if outcome == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await exercise()
+        elif outcome == "failure":
+            with pytest.raises(ExceptionGroup):
+                await exercise()
+        else:
+            await exercise()
+        assert [call[1]["sequence"] for call in calls] == list(range(1, len(calls) + 1))
+        assert all(call[1]["registration_token"] == "a" * 32 for call in calls)
+        phases = [call[1]["phase"] for call in calls]
+        assert phases[:2] == ["tool", "model_wait"]
+        assert ("rollout_complete" in phases) == (outcome in {"normal", "hint_failure"})
+        assert not interception._phase_sessions
+        assert _RelayClient.instances[-1].unregistered == ["phase-run"]
+    finally:
+        await interception.stop()
