@@ -158,7 +158,7 @@ class _RelaySession:
         self.client = client
         self.rollout_id = rollout_id
         self.kwargs = kwargs
-        self.base_url = f"{client.relay_url}/managed/{rollout_id}"
+        self.base_url = f"{client.relay_url}/managed/{rollout_id}/"
         self.run_kwargs: dict | None = None
 
     async def __aenter__(self):
@@ -202,7 +202,8 @@ class _RelayClient:
 
 
 @pytest.mark.asyncio
-async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
+@pytest.mark.parametrize("image_kind", ["registry", "name"])
+async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch, image_kind) -> None:
     import verifiers_ucloud.runtime as runtime_module
 
     _SandboxClient.instances.clear()
@@ -210,7 +211,7 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
     monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
 
     runtime = UCloudRuntime(
-        UCloudRuntimeConfig(cpu=2, memory=4, disk=8), name="sandbox-1"
+        UCloudRuntimeConfig(cpu=2, memory=4, disk=8, image_reference_type=image_kind), name="sandbox-1"
     )
     runtime.env = {"RUNTIME": "yes"}
     await runtime.start()
@@ -219,6 +220,8 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
     assert runtime.info.id == "sandbox-1"
     assert runtime.supports_live_processes
     assert client.created is not None
+    assert (client.created.image.name is not None) == (image_kind == "name")
+    assert (client.created.image.tag is not None) == (image_kind == "registry")
     spec = client.created.to_dict()
     assert spec["profile"] == "linux_host"
     assert spec["security"] is None
@@ -256,7 +259,11 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_interception_uses_managed_relay_session(monkeypatch) -> None:
+@pytest.mark.parametrize("relay_prefix", ["", "/relay"])
+@pytest.mark.parametrize("guest_url", [None, "http://gateway-private:8092"])
+@pytest.mark.parametrize("parkable", [False, True])
+@pytest.mark.parametrize("restricted", [False, True])
+async def test_interception_uses_managed_relay_session(monkeypatch, guest_url, parkable, restricted, relay_prefix) -> None:
     import verifiers_ucloud.interception as interception_module
 
     _InterceptionServer.instances.clear()
@@ -265,32 +272,43 @@ async def test_interception_uses_managed_relay_session(monkeypatch) -> None:
     monkeypatch.setattr(interception_module, "AsyncRelayWorkerClient", _RelayClient)
 
     interception = UCloudInterception(
-        UCloudInterceptionConfig(
-            relay_url="https://relay.example/",
-            max_inflight_requests=17,
-            forward_timeout_seconds=123.0,
-        ),
+        UCloudInterceptionConfig(relay_url=f"https://relay.example{relay_prefix}/", guest_relay_url=guest_url),
         requires_tunnel=True,
         state_service_secrets=("shared-secret",),
     )
     await interception.start()
-    session = cast(RolloutSession, SimpleNamespace(trace=SimpleNamespace(id="trace-1")))
+    handle = SimpleNamespace(id="sandbox-1", record={"generation": 1, "spec": {"parkable": True, "managed_process": True}})
+    runtime_info = SimpleNamespace(parkable=parkable, sandbox_handle=handle, network_restricted=restricted)
+    session = cast(RolloutSession, SimpleNamespace(trace=SimpleNamespace(id="trace-1", agent=SimpleNamespace(runtime=runtime_info))))
 
     async with interception.acquire(session) as slot:
         assert slot == (
-            "https://relay.example/managed/trace-1",
+            f"https://relay.example{relay_prefix}/managed/trace-1",
             "model-secret",
             "state-secret",
         )
 
+    from verifiers.v1.interception.tunnel import using_host_tunnel
+    runtime = UCloudRuntime(UCloudRuntimeConfig(
+        image="python:3.11-slim", allow=[] if restricted else ["*"],
+        guest_relay_url=guest_url,
+    ))
+    public = f"https://relay.example{relay_prefix}/managed/trace-1/mcp?state=capability"
+    with using_host_tunnel(interception.config.host_tunnel()):
+        expected = public.replace(f"https://relay.example{relay_prefix}", guest_url) if restricted and guest_url else public
+        assert runtime.host_url(public) == expected
+        assert runtime.host_url("https://unrelated.example/mcp") == "https://unrelated.example/mcp"
+        if relay_prefix:
+            assert runtime.host_url("https://relay.example/relay-other/mcp") == "https://relay.example/relay-other/mcp"
+
     relay = _RelayClient.instances[-1]
-    assert relay.kwargs["max_inflight_requests"] == 17
-    assert relay.kwargs["forward_timeout_seconds"] == 123.0
+    assert relay.relay_url == f"https://relay.example{relay_prefix}"
     relay_session = relay.sessions[-1]
     server = _InterceptionServer.instances[-1]
     assert relay.registered == ["trace-1"]
     assert relay.unregistered == ["trace-1"]
     assert relay_session.kwargs["metadata"] == {"consumer": "verifiers"}
+    assert relay_session.kwargs["sandbox"] is (handle if parkable else None)
     assert relay_session.run_kwargs is not None
     assert relay_session.run_kwargs["upstream_base_url"] == server.base_url
     assert relay_session.run_kwargs["lease_seconds"] == 900.0
@@ -300,66 +318,303 @@ async def test_interception_uses_managed_relay_session(monkeypatch) -> None:
     assert relay.closed
     assert server.closed
 
+@pytest.mark.asyncio
+async def test_runtime_cleans_up_after_loopback_setup_failure(monkeypatch) -> None:
+    import verifiers_ucloud.runtime as runtime_module
+    from verifiers.v1.errors import SandboxError
 
-def test_interception_request_budget_must_be_positive() -> None:
-    with pytest.raises(ValueError):
-        UCloudInterceptionConfig(max_inflight_requests=0)
+    class FailedHostsClient(_SandboxClient):
+        async def exec(self, sandbox_id, command, **kwargs):
+            return _Result(exit_code=1, stdout="", stderr="read-only hosts file")
+
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", FailedHostsClient)
+    runtime = UCloudRuntime(UCloudRuntimeConfig(), name="failed-hosts")
+    with pytest.raises(SandboxError, match="loopback hosts setup failed"):
+        await runtime.start()
+    client = FailedHostsClient.instances[-1]
+    assert client.deleted == ["failed-hosts"]
+    assert client.closed
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["normal", "cancel", "failure", "hint_failure"])
-async def test_resource_phase_hints_are_optional_fenced_and_non_authoritative(
-    monkeypatch, outcome
-):
+async def test_relay_worker_failure_logged_before_parent_cancellation(monkeypatch, caplog):
     import verifiers_ucloud.interception as module
+
+    async def fail(self, **kwargs):
+        await asyncio.sleep(0.01)
+        raise RuntimeError("relay failure sentinel")
 
     monkeypatch.setattr(module, "InterceptionServer", _InterceptionServer)
     monkeypatch.setattr(module, "AsyncRelayWorkerClient", _RelayClient)
-    monkeypatch.setattr(_RelaySession, "registration_token", "a" * 32, raising=False)
-    calls = []
-
-    async def update(self, rollout_id, **kwargs):
-        calls.append((rollout_id, kwargs))
-        if outcome == "hint_failure":
-            raise TimeoutError("unavailable")
-        return {"accepted": True}
-
-    monkeypatch.setattr(_RelayClient, "update_resource_phase", update, raising=False)
+    monkeypatch.setattr(_RelaySession, "run", fail)
     interception = UCloudInterception(
-        UCloudInterceptionConfig(
-            relay_url="https://relay.example", resource_phase_hints=True
-        )
+        UCloudInterceptionConfig(relay_url="https://relay.example")
     )
     await interception.start()
-    session = cast(
-        RolloutSession, SimpleNamespace(trace=SimpleNamespace(id="phase-run"))
-    )
-
-    async def exercise():
-        async with interception.acquire(session):
-            await interception.report_resource_phase(
-                "phase-run", "model_wait", expected_remaining_wait_seconds=20
-            )
-            if outcome == "cancel":
-                raise asyncio.CancelledError()
-            if outcome == "failure":
-                raise RuntimeError("tool failed")
-
+    assert _RelayClient.instances[-1].kwargs["forward_timeout_seconds"] == 7200
+    session = cast(RolloutSession, SimpleNamespace(trace=SimpleNamespace(id="failure-test")))
+    from verifiers_ucloud.supervision import with_relay
+    from verifiers.v1.errors import TunnelError
     try:
-        if outcome == "cancel":
-            with pytest.raises(asyncio.CancelledError):
-                await exercise()
-        elif outcome == "failure":
-            with pytest.raises(ExceptionGroup):
-                await exercise()
-        else:
-            await exercise()
-        assert [call[1]["sequence"] for call in calls] == list(range(1, len(calls) + 1))
-        assert all(call[1]["registration_token"] == "a" * 32 for call in calls)
-        phases = [call[1]["phase"] for call in calls]
-        assert phases[:2] == ["tool", "model_wait"]
-        assert ("rollout_complete" in phases) == (outcome in {"normal", "hint_failure"})
-        assert not interception._phase_sessions
-        assert _RelayClient.instances[-1].unregistered == ["phase-run"]
+        with pytest.raises(TunnelError, match="relay failure sentinel"):
+            async with interception.acquire(session):
+                await with_relay(asyncio.sleep(1))
+        assert "UCloud relay worker failed: rollout=failure-test" in caplog.text
+        assert "relay failure sentinel" in caplog.text
     finally:
         await interception.stop()
+
+
+@pytest.mark.asyncio
+async def test_relay_failure_does_not_cancel_sibling_and_external_cancel_propagates():
+    from verifiers_ucloud.supervision import relay_worker, with_relay
+    from verifiers.v1.errors import TunnelError
+
+    async def fail():
+        await asyncio.sleep(0)
+        raise RuntimeError("worker failed")
+
+    async def affected():
+        worker = asyncio.create_task(fail())
+        token = relay_worker.set(worker)
+        try:
+            with pytest.raises(TunnelError, match="worker failed"):
+                await with_relay(asyncio.sleep(10))
+        finally:
+            relay_worker.reset(token)
+
+    sibling = asyncio.create_task(asyncio.sleep(0.05, result="completed"))
+    await affected()
+    assert await sibling == "completed"
+    worker = asyncio.create_task(asyncio.sleep(10))
+    token = relay_worker.set(worker)
+    operation = asyncio.create_task(with_relay(asyncio.sleep(10)))
+    try:
+        await asyncio.sleep(0)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert not worker.done()
+    finally:
+        relay_worker.reset(token)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_parkable_runtime_validates_gateway_handle_without_serializing_it(monkeypatch):
+    import verifiers_ucloud.runtime as runtime_module
+
+    class ManagedClient(_SandboxClient):
+        async def create_sandbox(self, spec, **kwargs):
+            self.created = spec
+            return SimpleNamespace(id=spec.id, record={'generation': 3, 'spec': spec.to_dict()})
+
+    monkeypatch.setattr(runtime_module, 'AsyncSandboxClient', ManagedClient)
+    runtime = UCloudRuntime(UCloudRuntimeConfig(parkable=True), name='owned-managed-probe')
+    await runtime.start()
+    try:
+        spec = runtime.info.sandbox_handle.record['spec']
+        assert spec['parkable'] is True and spec['managed_process'] is True
+        assert spec['profile'] == 'container'
+        assert runtime.info.sandbox_generation == 3
+        assert 'sandbox_handle' not in runtime.info.model_dump_json()
+        with pytest.raises(Exception, match='staged portable Python'):
+            await runtime.open_process(['echo', 'no-streaming-exec'], {})
+    finally:
+        await runtime.stop()
+
+
+def test_relay_commit_retries_only_transport_with_identical_payload(monkeypatch):
+    from ucloud_sandboxes_sdk import AsyncRelayWorkerClient
+    from ucloud_sandboxes_sdk.relay import RelayApiError
+    from verifiers_ucloud.recovery import ResilientRelayWorkerClient
+    calls = []
+    async def request(self, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if len(calls) == 1:
+            raise RelayApiError("ack lost") from TimeoutError()
+        return {"ok": True}
+    async def no_sleep(_):
+        pass
+    monkeypatch.setattr(AsyncRelayWorkerClient, "_request_json", request)
+    monkeypatch.setattr("verifiers_ucloud.recovery.asyncio.sleep", no_sleep)
+    client = ResilientRelayWorkerClient("http://localhost", timeout_seconds=30)
+    body = {"request_id": "same-request", "body": "same-result"}
+    assert asyncio.run(client._request_json("POST", "/worker/respond", payload=body)) == {"ok": True}
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert calls[0][2]["timeout_seconds"] == 120
+    calls.clear()
+    with pytest.raises(RelayApiError):
+        asyncio.run(client._request_json("POST", "/worker/register", payload=body))
+    assert len(calls) == 1
+
+
+def test_managed_job_route_recovery_does_not_restart(monkeypatch):
+    from ucloud_sandboxes_sdk import SandboxApiError
+    from verifiers_ucloud.recovery import wait_for_managed_job
+    calls = []
+    async def refresh():
+        calls.append(1)
+        if len(calls) == 1:
+            raise SandboxApiError("sandbox route not found", status_code=404)
+        return SimpleNamespace(terminal=True)
+    job = SimpleNamespace(refresh=refresh, sandbox_id="sandbox", job_id="job")
+    assert asyncio.run(wait_for_managed_job(job, poll_seconds=0)).terminal
+    assert len(calls) == 2
+
+
+def test_completed_renewal_race_does_not_mask_other_errors(monkeypatch):
+    from ucloud_sandboxes_sdk import AsyncRelayWorkerClient
+    from ucloud_sandboxes_sdk.relay import RelayApiError
+    from verifiers_ucloud.recovery import ResilientRelayWorkerClient
+    request = object()
+    reason = ["request is already completed"]
+    async def renew(self, *args, **kwargs):
+        raise RelayApiError(reason[0], status_code=410)
+    monkeypatch.setattr(AsyncRelayWorkerClient, "renew_request", renew)
+    client = ResilientRelayWorkerClient("http://localhost")
+    assert asyncio.run(client.renew_request(request)) is request
+    reason[0] = "lease revoked"
+    with pytest.raises(RelayApiError, match="lease revoked"):
+        asyncio.run(client.renew_request(request))
+
+
+def test_sdk_worker_survives_completed_renewal_during_delivery(monkeypatch):
+    from ucloud_sandboxes_sdk import AsyncRelayWorkerClient
+    from ucloud_sandboxes_sdk.relay import RelayApiError, _handle_async_request
+    from verifiers_ucloud.recovery import ResilientRelayWorkerClient
+    async def scenario():
+        renewed = asyncio.Event()
+        forwarded = []
+        async def renew(self, *args, **kwargs):
+            renewed.set()
+            raise RelayApiError("request is already completed", status_code=410)
+        async def forward(self, request, upstream):
+            forwarded.append(request)
+            await asyncio.wait_for(renewed.wait(), timeout=2)
+        monkeypatch.setattr(AsyncRelayWorkerClient, "renew_request", renew)
+        monkeypatch.setattr(AsyncRelayWorkerClient, "forward_to", forward)
+        client = ResilientRelayWorkerClient("http://localhost")
+        request = SimpleNamespace(endpoint="/v1/chat/completions", body={})
+        await _handle_async_request(client, request, handler=None, upstream_base_url="http://localhost", worker_id="worker", lease_seconds=1, renewal_interval_seconds=0.001)
+        assert forwarded == [request]
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("word", ["load", "pressure"])
+def test_file_admission_retries_both_cpu_messages(monkeypatch, word):
+    from ucloud_sandboxes_sdk import SandboxApiError
+    from verifiers_ucloud.runtime import _retry_file_admission
+    calls=[]
+    async def operation():
+        calls.append(1)
+        if len(calls)==1:
+            raise SandboxApiError(f"direct node CPU {word} blocks active admission", status_code=503)
+        return "ok"
+    async def sleep(delay):
+        pass
+    monkeypatch.setattr("verifiers_ucloud.runtime.asyncio.sleep", sleep)
+    assert asyncio.run(_retry_file_admission(operation)) == "ok"
+    assert len(calls)==2
+
+
+def test_node_lost_is_terminal_for_job_and_relay(monkeypatch):
+    from ucloud_sandboxes_sdk import AsyncRelayWorkerClient, SandboxApiError
+    from ucloud_sandboxes_sdk.relay import RelayApiError
+    from verifiers_ucloud.recovery import SandboxNodeLost, ResilientRelayWorkerClient, wait_for_managed_job
+    calls = []
+    async def refresh():
+        calls.append("refresh")
+        raise SandboxApiError("sandbox route not found", status_code=404, body={"error_code": "node_lost"})
+    async def request(*args, **kwargs):
+        calls.append("relay")
+        raise RelayApiError("wake failed", status_code=503, body={"error_code": "node_lost", "retryable": True})
+    monkeypatch.setattr(AsyncRelayWorkerClient, "_request_json", request)
+    job = SimpleNamespace(refresh=refresh, sandbox_id="sandbox", job_id="job")
+    with pytest.raises(SandboxNodeLost, match="node_lost"):
+        asyncio.run(wait_for_managed_job(job, poll_seconds=0))
+    client = ResilientRelayWorkerClient("http://localhost")
+    with pytest.raises(SandboxNodeLost, match="node_lost"):
+        asyncio.run(client._request_json("POST", "/worker/respond"))
+    assert calls == ["refresh", "relay"]
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_managed_log_read_retries_same_cursor(monkeypatch, stream):
+    from ucloud_sandboxes_sdk import SandboxApiError
+    from verifiers_ucloud.recovery import read_managed_logs
+
+    calls = []
+    sleeps = []
+    chunk = SimpleNamespace(data=b"next bytes", next_offset=133)
+
+    async def logs(stream, *, offset):
+        calls.append((stream, offset))
+        if len(calls) < 3:
+            raise SandboxApiError("retry read", status_code=503, body={
+                "error_code": "managed_process_read_unavailable", "retryable": True,
+            })
+        return chunk
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr("verifiers_ucloud.recovery.asyncio.sleep", sleep)
+    job = SimpleNamespace(logs=logs, sandbox_id="sandbox", job_id="job")
+    assert asyncio.run(read_managed_logs(job, stream, offset=123)) is chunk
+    assert calls == [(stream, 123)] * 3
+    assert sleeps == [1, 2]
+
+
+@pytest.mark.parametrize("kind,expected_calls", [
+    ("exhausted", 5), ("nonretryable", 1), ("unrelated", 1),
+    ("node_lost", 1), ("cancelled", 1), ("missing_workdir", 1),
+])
+def test_managed_log_read_failure_boundaries(monkeypatch, kind, expected_calls):
+    from ucloud_sandboxes_sdk import SandboxApiError
+    from verifiers_ucloud.recovery import SandboxNodeLost, read_managed_logs
+
+    body = {"error_code": "managed_process_read_unavailable", "retryable": True}
+    if kind == "nonretryable":
+        body["retryable"] = False
+    elif kind in ("unrelated", "node_lost"):
+        body["error_code"] = kind
+    if kind == "missing_workdir":
+        body["error"] = "failed to find initial working directory: no such file or directory"
+    error = asyncio.CancelledError() if kind == "cancelled" else SandboxApiError(
+        "failed", status_code=503, body=body,
+    )
+    calls = []
+
+    async def logs(stream, *, offset):
+        calls.append((stream, offset))
+        raise error
+
+    async def sleep(delay):
+        pass
+
+    monkeypatch.setattr("verifiers_ucloud.recovery.asyncio.sleep", sleep)
+    job = SimpleNamespace(logs=logs, sandbox_id="sandbox", job_id="job")
+    expected = SandboxNodeLost if kind == "node_lost" else type(error)
+    with pytest.raises(expected):
+        asyncio.run(read_managed_logs(job, "stdout", offset=42))
+    assert calls == [("stdout", 42)] * expected_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["image", "poll"])
+async def test_confirmed_image_failure_keeps_its_type(monkeypatch, tmp_path, kind):
+    from verifiers_ucloud.image_builds import ImageBuildFailure, ImageBuildPollingError
+    error_type = ImageBuildFailure if kind == "image" else ImageBuildPollingError
+
+    async def failed_build(*args):
+        raise error_type("confirmed failed recipe")
+
+    monkeypatch.setattr("verifiers_ucloud.image_builds.prepare_image_async", failed_build)
+    runtime = UCloudRuntime(UCloudRuntimeConfig(
+        parkable=True, image_recipe_db=tmp_path / "recipes.sqlite", image_build_cache=tmp_path / "builds",
+    ), name="failed-image-probe")
+    with pytest.raises(error_type, match="confirmed failed recipe"):
+        await runtime.start()
+    assert runtime.info.id is None

@@ -2,23 +2,37 @@
 
 from __future__ import annotations
 
+from ._resources import ensure_file_descriptor_capacity
+from .image_builds import ImageBuildFailure, ImageBuildPollingError
+
 import asyncio
 import contextlib
 import logging
+import json
+import os
+from urllib.parse import urlsplit, urlunsplit
 import shlex
-from collections.abc import AsyncIterator
-from pathlib import PurePosixPath
-from typing import ClassVar, Literal
 
-from pydantic import Field
+from .supervision import with_relay
+from .recovery import SandboxNodeLost, is_node_lost
+from verifiers.v1.errors import TunnelError
+from collections.abc import AsyncIterator
+from pathlib import Path, PurePosixPath
+from typing import Any, ClassVar, Literal
+
+from pydantic import Field, model_validator
 from ucloud_sandboxes_sdk import (
     AsyncSandboxClient,
     AsyncSandboxProcess,
     Image,
     SandboxClient,
+    SandboxApiError,
     SandboxSpec,
+    SandboxNetworkPolicy,
+    SandboxSecuritySpec,
+    SandboxFilesystemSpec,
 )
-from verifiers.v1.configs.runtime import BaseRuntimeConfig
+from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.runtimes.base import (
     BaseRuntimeInfo,
@@ -29,34 +43,68 @@ from verifiers.v1.runtimes.base import (
 )
 from verifiers.v1.runtimes.limiters import creation_limiter
 
-from ._resources import ensure_file_descriptor_capacity
-
 logger = logging.getLogger(__name__)
+
+
+async def _retry_file_admission(operation):
+    """Retry only idempotent file transfers rejected by CPU admission."""
+    for attempt in range(8):
+        try:
+            return await operation()
+        except SandboxApiError as exc:
+            cpu_admission = any(message in str(exc) for message in (
+                "direct node CPU load blocks active admission",
+                "direct node CPU pressure blocks active admission",
+            ))
+            if exc.status_code != 503 or not cpu_admission or attempt == 7:
+                raise
+            delay = min(2 ** attempt, 8)
+            logger.warning("Sandbox file transfer rejected by CPU admission; retrying in %ss", delay)
+            await asyncio.sleep(delay)
 
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
 _DEFAULT_CREATE_TIMEOUT_SECONDS = 900.0
 
 
-class UCloudRuntimeConfig(BaseRuntimeConfig):
+class UCloudRuntimeConfig(NetworkPolicyConfig):
     """Configuration for one gateway-managed sandbox."""
 
     type: Literal["ucloud"] = "ucloud"
     image: str = "python:3.11-slim"
     workdir: str = "/app"
     network_access: bool = True
+    offline_python_bundle: Path | None = None
+    offline_harness_bundle: Path | None = None
+    image_reference_type: Literal["registry", "name"] = "registry"
+    image_manifest: Path | None = None
+    image_recipe_db: Path | None = None
+    image_build_cache: Path | None = None
+    guest_relay_url: str | None = None
+    relay_name: str = Field(default="default", pattern=r"^[a-z][a-z0-9-]{0,31}$")
+
+    @model_validator(mode="after")
+    def validate_relay_policy(self):
+        if self.network_restricted:
+            if self.allow:
+                raise ValueError("UCloud supports framework-only relay access, not custom allow/block lists")
+            if not self.network_access:
+                raise ValueError("Framework-only UCloud access requires bridge transport for the relay")
+        return self
     cpu: float = 1.0
     memory: float = 2.0
     gpu: str | None = None
     disk: float = 5.0
     ttl_seconds: int = 24 * 60 * 60
     labels: dict[str, str] = Field(default_factory=dict)
+    parkable: bool = False
     creates_per_sec: float | None = None
     request_timeout_seconds: float = _DEFAULT_REQUEST_TIMEOUT_SECONDS
     create_timeout_seconds: float = _DEFAULT_CREATE_TIMEOUT_SECONDS
 
 
 class UCloudRuntimeInfo(UCloudRuntimeConfig, BaseRuntimeInfo):
-    pass
+    sandbox_generation: int | None = None
+    sandbox_handle: Any = Field(default=None, exclude=True, repr=False)
 
 
 async def _read_stream(reader: asyncio.StreamReader) -> AsyncIterator[bytes]:
@@ -98,11 +146,25 @@ class UCloudRuntime(Runtime):
         self.config = config
         self.info = UCloudRuntimeInfo(**config.model_dump())
         self._client: AsyncSandboxClient | None = None
+        self._offline_setup_lock = asyncio.Lock()
+        self._offline_prefix: str | None = None
 
     def _client_or_raise(self) -> AsyncSandboxClient:
         if self._client is None:
             raise SandboxError("ucloud runtime has not been started")
         return self._client
+
+    def _resolved_image(self):
+        if self.config.image_manifest is None:
+            return (Image.from_name(self.config.image) if self.config.image_reference_type == "name"
+                    else Image.from_registry(self.config.image))
+        manifest = json.loads(self.config.image_manifest.read_text())
+        if manifest.get("version") != 1:
+            raise SandboxError("Unsupported prepared image manifest version")
+        entry = manifest.get("images", {}).get(self.config.image)
+        if not isinstance(entry, dict) or entry.get("validated") is not True or not entry.get("image"):
+            raise SandboxError(f"No validated prepared image for {self.config.image!r}")
+        return Image.from_name(entry["image"])
 
     async def start(self) -> None:
         ensure_file_descriptor_capacity()
@@ -111,18 +173,37 @@ class UCloudRuntime(Runtime):
             raise SandboxError("ucloud runtime currently supports CPU-only sandboxes")
 
         try:
+            if self.config.image_recipe_db is not None:
+                from .image_builds import prepare_image_async
+                if self.config.image_build_cache is None:
+                    raise ValueError("image_recipe_db requires image_build_cache")
+                image = await prepare_image_async(self.config.image, self.config.image_recipe_db, self.config.image_build_cache)
+            else:
+                image = self._resolved_image()
             self._client = AsyncSandboxClient.from_env(
                 timeout_seconds=self.config.request_timeout_seconds
             )
-            spec = SandboxSpec.benchmark(
+            spec_factory = SandboxSpec if self.config.parkable else SandboxSpec.benchmark
+            parking = {}
+            if self.config.parkable:
+                parking = {
+                    "parkable": True, "managed_process": True, "profile": "container",
+                    "security": SandboxSecuritySpec(user="0:0", cap_drop=(), cap_add=(),
+                        no_new_privileges=False, pids_limit=None, read_only_rootfs=False),
+                    "filesystem": SandboxFilesystemSpec(tmpfs_mb=256, run_tmpfs_mb=64),
+                }
+            spec = spec_factory(
+                **parking,
                 id=self.name,
-                image=Image.from_registry(self.config.image),
+                image=image,
                 env=self.env,
                 working_dir=self.config.workdir,
                 cpus=self.config.cpu,
                 memory_mb=round(self.config.memory * 1024),
                 disk_mb=round(self.config.disk * 1024),
                 network="bridge" if self.config.network_access else "none",
+                network_policy=(SandboxNetworkPolicy.relay_only(self.config.relay_name)
+                                if self.network_restricted else SandboxNetworkPolicy()),
                 ttl_seconds=self.config.ttl_seconds,
                 labels=self.config.labels,
             )
@@ -135,23 +216,94 @@ class UCloudRuntime(Runtime):
                     request_timeout_seconds=self.config.create_timeout_seconds,
                 )
             self.info.id = handle.id
+            if self.config.parkable:
+                record = handle.record
+                if not record.get("spec", {}).get("parkable") or not record.get("spec", {}).get("managed_process"):
+                    raise SandboxError("Gateway did not create the requested parkable managed sandbox")
+                generation = record.get("generation")
+                if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+                    raise SandboxError("Gateway did not return a positive sandbox generation")
+                self.info.sandbox_handle = handle
+                self.info.sandbox_generation = generation
+            # Extracted images can have an empty hosts file on this gateway.
+            # Preserve existing entries and restore standard loopback names.
+            hosts = await self.run(
+                ["sh", "-c", "if ! getent hosts localhost >/dev/null 2>&1; then "
+                 "printf '\\n127.0.0.1 localhost\\n::1 localhost ip6-localhost ip6-loopback\\n' >> /etc/hosts; fi; "
+                 "sandbox_hostname=$(cat /proc/sys/kernel/hostname); "
+                 'if ! getent hosts "$sandbox_hostname" >/dev/null 2>&1; then '
+                 'printf "\\n127.0.0.1 %s\\n" "$sandbox_hostname" >> /etc/hosts; fi'],
+                {},
+            )
+            if hosts.exit_code:
+                raise SandboxError(f"ucloud loopback hosts setup failed: {hosts.stderr}")
+            if self.config.offline_harness_bundle is not None:
+                from .offline import prepare_harness_bundle
+                await prepare_harness_bundle(self)
         except Exception as exc:
             client, self._client = self._client, None
             if client is not None:
+                if self.info.id is not None:
+                    with contextlib.suppress(Exception):
+                        await client.delete_sandbox(self.info.id)
                 with contextlib.suppress(Exception):
                     await client.close()
+            if isinstance(exc, SandboxNodeLost) or is_node_lost(exc):
+                raise SandboxNodeLost(f"node_lost: {exc}") from exc
+            if isinstance(exc, (ImageBuildFailure, ImageBuildPollingError)):
+                raise
             raise SandboxError(f"ucloud sandbox provisioning failed: {exc}") from exc
+
+    def host_url(self, url: str) -> str:
+        # Shared host services publish the external relay capability. Only restricted
+        # guests need its private origin; preserve the full capability path/query.
+        from verifiers.v1.interception.tunnel import configured_host_tunnel
+
+        transport = getattr(configured_host_tunnel(), "config", None)
+        guest_url = self.config.guest_relay_url or getattr(transport, "guest_relay_url", None)
+        if self.network_restricted and guest_url:
+            public = urlsplit(getattr(transport, "relay_url", None) or os.environ.get("UCLOUD_RELAY_URL", ""))
+            parsed = urlsplit(url)
+            if public.netloc and (parsed.scheme, parsed.netloc) == (public.scheme, public.netloc):
+                guest = urlsplit(guest_url)
+                prefix = public.path.rstrip("/")
+                if prefix and parsed.path != prefix and not parsed.path.startswith(prefix + "/"):
+                    return super().host_url(url)
+                path = guest.path.rstrip("/") + parsed.path[len(prefix):]
+                return urlunsplit((guest.scheme, guest.netloc, path, parsed.query, parsed.fragment))
+        return super().host_url(url)
+
+    async def prepare_uv_script(self, script, env=None, *, activate=True):
+        if not self.network_restricted:
+            return await super().prepare_uv_script(script, env, activate=activate)
+        from .offline import prepare_script
+        return await prepare_script(self, script, env, activate=activate)
+
+    async def prepare_execution(self, routes: list[str] | None) -> None:
+        if not self.network_restricted:
+            return
+        if routes is None:
+            raise SandboxError("Relay-only UCloud networking is immutable; setup must use baked or staged dependencies")
+        relay = urlsplit(self.config.guest_relay_url or os.environ.get("UCLOUD_RELAY_URL", ""))
+        def origin(url):
+            parsed = urlsplit(url)
+            return parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+        if not relay.hostname or any(origin(route) != origin(relay.geturl()) for route in routes):
+            raise SandboxError("Framework route is outside the configured UCloud relay origin")
+        # The gateway enforces the named relay policy from sandbox creation onward.
 
     async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         if self.info.id is None:
             raise SandboxError("ucloud sandbox has no id")
         try:
-            result = await self._client_or_raise().exec(
+            result = await with_relay(self._client_or_raise().exec(
                 self.info.id,
                 argv,
                 env=self.process_env(env),
                 working_dir=self.config.workdir,
-            )
+            ))
+        except (TunnelError, SandboxNodeLost):
+            raise
         except Exception as exc:
             raise SandboxError(f"ucloud exec failed: {exc}") from exc
         return ProgramResult(
@@ -160,9 +312,52 @@ class UCloudRuntime(Runtime):
             stderr=result.stderr,
         )
 
+    async def run_program(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+        if not self.config.parkable:
+            return await self.run(argv, env)
+        handle = self.info.sandbox_handle
+        if handle is None:
+            raise SandboxError("Parkable runtime has no validated sandbox handle")
+        job = None
+        try:
+            # Start exactly once. Polling never restarts the agent program.
+            job = await handle.start_agent(argv, env=self.process_env(env), working_dir=self.config.workdir)
+            from .recovery import read_managed_logs, wait_for_managed_job
+            record = await with_relay(wait_for_managed_job(job))
+            outputs = []
+            for stream in ("stdout", "stderr"):
+                chunks = []
+                offset = 0
+                while True:
+                    chunk = await with_relay(read_managed_logs(job, stream, offset=offset))
+                    chunks.append(chunk.data)
+                    if chunk.eof:
+                        break
+                    if chunk.next_offset <= offset:
+                        raise SandboxError("Managed job log cursor did not advance")
+                    offset = chunk.next_offset
+                outputs.append(b"".join(chunks).decode("utf-8", errors="replace"))
+            if record.stdout_truncated or record.stderr_truncated:
+                raise SandboxError("Managed agent output exceeded its log limit")
+            return ProgramResult(exit_code=record.exit_code if record.exit_code is not None else 1,
+                                 stdout=outputs[0], stderr=outputs[1])
+        except (TunnelError, SandboxNodeLost) as exc:
+            if is_node_lost(exc):
+                job = None  # The lost node cannot receive a process signal.
+            raise
+        except Exception as exc:
+            raise SandboxError(f"ucloud managed agent failed: {exc}") from exc
+        finally:
+            if job is not None and not job.record.terminal:
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(job.signal(9))
+
     async def open_process(
         self, argv: list[str], env: dict[str, str]
     ) -> RuntimeProcess:
+        if self.config.parkable:
+            from .managed_process import ManagedProcess
+            return await ManagedProcess.start(self, argv, env)
         if self.info.id is None:
             raise SandboxError("ucloud sandbox has no id")
         try:
@@ -173,6 +368,8 @@ class UCloudRuntime(Runtime):
                 working_dir=self.config.workdir,
             )
         except Exception as exc:
+            if isinstance(exc, SandboxNodeLost) or is_node_lost(exc):
+                raise SandboxNodeLost(f"node_lost: {exc}") from exc
             raise SandboxError(f"ucloud live process failed to start: {exc}") from exc
         return UCloudProcess(process)
 
@@ -191,14 +388,18 @@ class UCloudRuntime(Runtime):
             return path
         return f"{self.config.workdir.rstrip('/')}/{path}"
 
-    async def _read(self, path: str) -> bytes:
+    async def _read(self, path: str, max_bytes: int | None = None) -> bytes:
+        if max_bytes is not None:
+            return await super()._read(path, max_bytes=max_bytes)
         if self.info.id is None:
             raise SandboxError("ucloud sandbox has no id")
         try:
-            return await self._client_or_raise().download_file(
+            return await _retry_file_admission(lambda: self._client_or_raise().download_file(
                 self.info.id, self._absolute(path)
-            )
+            ))
         except Exception as exc:
+            if isinstance(exc, SandboxNodeLost) or is_node_lost(exc):
+                raise SandboxNodeLost(f"node_lost: {exc}") from exc
             raise SandboxError(f"read {path!r}: {exc}") from exc
 
     async def write(self, path: str, data: bytes) -> None:
@@ -210,8 +411,10 @@ class UCloudRuntime(Runtime):
         if mkdir.exit_code != 0:
             raise SandboxError(f"write {path!r}: {mkdir.stderr.strip()}")
         try:
-            await self._client_or_raise().upload_file(self.info.id, target, data)
+            await _retry_file_admission(lambda: self._client_or_raise().upload_file(self.info.id, target, data))
         except Exception as exc:
+            if isinstance(exc, SandboxNodeLost) or is_node_lost(exc):
+                raise SandboxNodeLost(f"node_lost: {exc}") from exc
             raise SandboxError(f"write {path!r}: {exc}") from exc
 
     def cleanup(self) -> None:
