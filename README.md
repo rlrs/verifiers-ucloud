@@ -49,6 +49,15 @@ cannot create groups (ranked placement answers 501) use single creates.
 per process: an env-server pool dispatches each request to its least-busy worker, which
 can split one example's rollouts across workers.
 
+By default (`managed_agent = true`) each rollout gets a parkable managed-process sandbox
+and its main program (`run_program`: the harness) runs as the sandbox's managed primary
+process; setup, tools and `open_process` stay execs. The interception binds the
+rollout's relay session to that sandbox, so the gateway knows each model call as the
+sandbox's wait: it pauses or parks the sandbox through the wait and charges disk by what
+the sandbox writes. Needs a verifiers that passes the runtime to
+`Interception.acquire`; with an older one the session stays unbound. Set
+`managed_agent = false` for a `linux_host` sandbox that runs the program as one exec.
+
 A single `write` is one upload request; `write_many` (skill folders, MCP and judge
 files) sends all its files in one archive request (`PUT /v1/sandboxes/{id}/archive`).
 Either way the gateway creates missing parent directories and writes each file as 0600.

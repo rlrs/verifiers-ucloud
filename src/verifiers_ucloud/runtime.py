@@ -11,10 +11,13 @@ from typing import ClassVar, Literal
 
 from pydantic import Field
 from ucloud_sandboxes_sdk import (
+    AsyncJobHandle,
     AsyncSandboxClient,
+    AsyncSandboxHandle,
     AsyncSandboxProcess,
     Image,
     SandboxClient,
+    SandboxSecuritySpec,
     SandboxSpec,
 )
 from verifiers.v1.configs.runtime import BaseRuntimeConfig
@@ -62,6 +65,14 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
     group_max_size: int = Field(32, ge=2, le=512)
     """A group is sent at once when it reaches this size."""
     group_placement: Literal["pack", "spread"] = "pack"
+    managed_agent: bool = True
+    """Run the rollout's main program (`run_program`) as the sandbox's managed
+    primary process in a parkable sandbox. The gateway then knows the rollout's
+    model calls as waits, pausing or parking the sandbox through them, and charges
+    disk by what it writes. False keeps a `linux_host` sandbox that runs the
+    program as one exec."""
+    agent_poll_seconds: float = Field(2.0, gt=0)
+    """How often a waiting `run_program` asks whether its managed program ended."""
 
 
 class UCloudRuntimeInfo(UCloudRuntimeConfig, BaseRuntimeInfo):
@@ -77,6 +88,21 @@ def _same_file_key(path: str) -> str:
 async def _read_stream(reader: asyncio.StreamReader) -> AsyncIterator[bytes]:
     while chunk := await reader.read(64 * 1024):
         yield chunk
+
+
+async def _job_output(job: AsyncJobHandle) -> tuple[str, str]:
+    """Both streams of a finished managed program, read to their end."""
+    streams = []
+    for stream in ("stdout", "stderr"):
+        data, offset = bytearray(), 0
+        while True:
+            chunk = await job.logs(stream, offset=offset)
+            data += chunk.data
+            if chunk.eof or chunk.next_offset <= offset:
+                break
+            offset = chunk.next_offset
+        streams.append(data.decode(errors="replace"))
+    return streams[0], streams[1]
 
 
 class UCloudProcess(RuntimeProcess):
@@ -113,6 +139,8 @@ class UCloudRuntime(Runtime):
         self.config = config
         self.info = UCloudRuntimeInfo(**config.model_dump())
         self._client: AsyncSandboxClient | None = None
+        self.sandbox: AsyncSandboxHandle | None = None
+        """The started sandbox; interception binds the rollout's relay session to it."""
 
     def _client_or_raise(self) -> AsyncSandboxClient:
         if self._client is None:
@@ -129,18 +157,7 @@ class UCloudRuntime(Runtime):
             self._client = AsyncSandboxClient.from_env(
                 timeout_seconds=self.config.request_timeout_seconds
             )
-            spec = SandboxSpec.benchmark(
-                id=self.name,
-                image=Image.from_registry(self.config.image),
-                env=self.env,
-                working_dir=self.config.workdir,
-                cpus=self.config.cpu,
-                memory_mb=round(self.config.memory * 1024),
-                disk_mb=round(self.config.disk * 1024),
-                network="bridge" if self.config.network_access else "none",
-                ttl_seconds=self.config.ttl_seconds,
-                labels=self.config.labels,
-            )
+            spec = self._spec()
             member = (
                 await group_creates().create(spec, self._group_policy())
                 if self.config.group_create
@@ -151,20 +168,80 @@ class UCloudRuntime(Runtime):
                     creation_limiter(self.config.creates_per_sec, "ucloud-sandbox")
                     or contextlib.nullcontext()
                 ):
-                    handle = await self._client.create_sandbox(
+                    self.sandbox = await self._client.create_sandbox(
                         spec,
                         request_timeout_seconds=self.config.create_timeout_seconds,
                     )
-                member = handle.id
             else:
-                logger.debug("ucloud runtime %s is sandbox %s", self.name, member)
-            self.info.id = member
+                sandbox_id, generation = member
+                logger.debug("ucloud runtime %s is sandbox %s", self.name, sandbox_id)
+                # A group member's record is the requested spec at its generation.
+                self.sandbox = AsyncSandboxHandle(
+                    self._client,
+                    sandbox_id,
+                    record={"spec": spec.to_dict(), "generation": generation},
+                )
+            self.info.id = self.sandbox.id
         except Exception as exc:
             client, self._client = self._client, None
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.close()
             raise SandboxError(f"ucloud sandbox provisioning failed: {exc}") from exc
+
+    def _spec(self) -> SandboxSpec:
+        common = dict(
+            id=self.name,
+            image=Image.from_registry(self.config.image),
+            env=self.env,
+            working_dir=self.config.workdir,
+            cpus=self.config.cpu,
+            memory_mb=round(self.config.memory * 1024),
+            disk_mb=round(self.config.disk * 1024),
+            network="bridge" if self.config.network_access else "none",
+            ttl_seconds=self.config.ttl_seconds,
+            labels=self.config.labels,
+        )
+        if not self.config.managed_agent:
+            return SandboxSpec.benchmark(**common)
+        # A managed primary needs the container profile. Its security matches
+        # linux_host's (no dropped capabilities, no process limit), as root.
+        return SandboxSpec(
+            **common,
+            managed_process=True,
+            parkable=True,
+            security=SandboxSecuritySpec(
+                user="0:0", cap_drop=(), no_new_privileges=False, pids_limit=None
+            ),
+        )
+
+    async def run_program(
+        self, argv: list[str], env: dict[str, str]
+    ) -> ProgramResult:
+        if not self.config.managed_agent:
+            return await self.run(argv, env)
+        if self.sandbox is None:
+            raise SandboxError("ucloud sandbox has no id")
+        try:
+            job = await self.sandbox.start_agent(
+                argv, env=self.process_env(env), working_dir=self.config.workdir
+            )
+            try:
+                record = await job.wait(poll_seconds=self.config.agent_poll_seconds)
+            except asyncio.CancelledError:
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(job.signal(9))
+                raise
+            stdout, stderr = await _job_output(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise SandboxError(f"ucloud agent failed: {exc}") from exc
+        return ProgramResult(
+            exit_code=record.exit_code if record.exit_code is not None else 1,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
     def _group_policy(self) -> GroupPolicy:
         return GroupPolicy(

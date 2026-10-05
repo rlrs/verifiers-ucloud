@@ -87,6 +87,31 @@ class _Process:
         return 7
 
 
+class _Job:
+    def __init__(self, argv, kwargs) -> None:
+        self.argv, self.kwargs, self.signals = argv, kwargs, []
+
+    async def wait(self, **kwargs):
+        self.wait_kwargs = kwargs
+        return SimpleNamespace(state="exited", exit_code=3)
+
+    async def logs(self, stream: str, *, offset: int = 0):
+        data = {"stdout": b"agent out", "stderr": b"agent err"}[stream]
+        return SimpleNamespace(data=data[offset:], next_offset=len(data), eof=True)
+
+    async def signal(self, signal: int = 15):
+        self.signals.append(signal)
+
+
+class _Sandbox:
+    def __init__(self, id: str, record: dict) -> None:
+        self.id, self.record, self.jobs = id, record, []
+
+    async def start_agent(self, argv, **kwargs):
+        self.jobs.append(_Job(argv, kwargs))
+        return self.jobs[-1]
+
+
 class _SandboxClient:
     instances: ClassVar[list[_SandboxClient]] = []
 
@@ -111,7 +136,7 @@ class _SandboxClient:
     async def create_sandbox(self, spec, **kwargs):
         self.created = spec
         self.create_kwargs = kwargs
-        return SimpleNamespace(id=spec.id)
+        return _Sandbox(spec.id, {"spec": spec.to_dict(), "generation": 1})
 
     async def exec(self, sandbox_id: str, command: list[str], **kwargs):
         self.execs.append((sandbox_id, command, kwargs))
@@ -238,9 +263,11 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
     assert runtime.supports_live_processes
     assert client.created is not None
     spec = client.created.to_dict()
-    assert spec["profile"] == "linux_host"
-    assert spec["security"] is None
-    assert spec["filesystem"] is None
+    # A managed agent sandbox: parkable, container profile, linux_host's security.
+    assert spec["profile"] == "container"
+    assert spec["managed_process"] is True and spec["parkable"] is True
+    assert spec["security"]["user"] == "0:0"
+    assert spec["security"]["cap_drop"] == [] and spec["security"]["pids_limit"] is None
     assert spec["command"] == []
     assert spec["cpus"] == 2
     assert spec["memory_mb"] == 4096
@@ -251,6 +278,15 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
     result = await runtime.run(["echo", "ok"], {"CALL": "yes"})
     assert result.stdout == "ok"
     assert client.execs[-1][2]["env"] == {"RUNTIME": "yes", "CALL": "yes"}
+
+    # The rollout's main program is the sandbox's managed primary, not an exec.
+    program = await runtime.run_program(["harness", "--go"], {"MAIN": "yes"})
+    assert (program.exit_code, program.stdout, program.stderr) == (3, "agent out", "agent err")
+    job = runtime.sandbox.jobs[-1]
+    assert job.argv == ["harness", "--go"]
+    assert job.kwargs == {"env": {"RUNTIME": "yes", "MAIN": "yes"}, "working_dir": "/app"}
+    assert job.wait_kwargs == {"poll_seconds": 2.0}
+    assert len(client.execs) == 1
 
     process = await runtime.open_process(["agent"], {"PROCESS": "yes"})
     await process.write(b"request")
@@ -271,6 +307,24 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
     await runtime.stop()
     assert client.deleted == ["sandbox-1"]
     assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_linux_host_runtime_runs_its_program_as_an_exec(monkeypatch) -> None:
+    import verifiers_ucloud.runtime as runtime_module
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(managed_agent=False, group_create=False), name="sandbox-1"
+    )
+    await runtime.start()
+    client = _SandboxClient.instances[-1]
+    spec = client.created.to_dict()
+    assert spec["profile"] == "linux_host" and spec["security"] is None
+    assert not spec.get("managed_process") and not spec.get("parkable")
+    assert (await runtime.run_program(["harness"], {})).stdout == "ok"
+    assert client.execs[-1][1] == ["harness"] and runtime.sandbox.jobs == []
 
 
 async def _started_runtime(monkeypatch) -> tuple[UCloudRuntime, _SandboxClient]:
@@ -405,6 +459,22 @@ async def test_interception_uses_managed_relay_session(monkeypatch) -> None:
     assert relay_session.run_kwargs["upstream_base_url"] == server.base_url
     assert relay_session.run_kwargs["lease_seconds"] == 900.0
     assert server.unregistered == [("model-secret", "state-secret")]
+    assert relay_session.kwargs["sandbox"] is None  # no runtime: an unbound session
+
+    # A managed agent runtime's sandbox is bound, so its model calls are its waits.
+    import verifiers_ucloud.runtime as runtime_module
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    for managed in (True, False):
+        runtime = UCloudRuntime(
+            UCloudRuntimeConfig(managed_agent=managed, group_create=False), name="sb"
+        )
+        await runtime.start()
+        async with interception.acquire(session, runtime):
+            pass
+        bound = relay.sessions[-1].kwargs["sandbox"]
+        assert bound is (runtime.sandbox if managed else None)
 
     await interception.stop()
     assert relay.closed

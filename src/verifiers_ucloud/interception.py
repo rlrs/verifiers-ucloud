@@ -13,12 +13,14 @@ from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import PositiveInt
-from ucloud_sandboxes_sdk import AsyncRelayWorkerClient
+from ucloud_sandboxes_sdk import AsyncRelayWorkerClient, AsyncSandboxHandle
 from verifiers.v1.interception.base import BaseInterceptionConfig, Interception, Slot
 from verifiers.v1.interception.server import InterceptionServer
+from verifiers.v1.runtimes.base import Runtime
 from verifiers.v1.session import RolloutSession
 
 from ._resources import ensure_file_descriptor_capacity
+from .runtime import UCloudRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +120,9 @@ class UCloudInterception(Interception):
             return False
 
     @asynccontextmanager
-    async def acquire(self, session: RolloutSession) -> AsyncIterator[Slot]:
+    async def acquire(
+        self, session: RolloutSession, runtime: Runtime | None = None
+    ) -> AsyncIterator[Slot]:
         relay = self.relay
         if relay is None:
             raise RuntimeError("ucloud interception has not been started")
@@ -131,6 +135,7 @@ class UCloudInterception(Interception):
                 rollout_id,
                 worker_id=self.worker_id,
                 metadata={"consumer": "verifiers"},
+                sandbox=_agent_sandbox(runtime),
             ) as tunnel:
                 if self.config.resource_phase_hints:
                     registration_token = tunnel.registration_token
@@ -161,3 +166,14 @@ class UCloudInterception(Interception):
         finally:
             self._phase_sessions.pop(rollout_id, None)
             self.server.unregister(model_secret, state_secret)
+
+
+def _agent_sandbox(runtime: Runtime | None) -> AsyncSandboxHandle | None:
+    """The managed agent sandbox a rollout's model calls come from, if any.
+
+    Bound to it, the relay knows each call as the sandbox's model wait, so the
+    gateway can pause or park the sandbox until the answer arrives.
+    """
+    if not isinstance(runtime, UCloudRuntime) or not runtime.config.managed_agent:
+        return None
+    return runtime.sandbox

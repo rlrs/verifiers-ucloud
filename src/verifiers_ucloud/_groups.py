@@ -33,7 +33,9 @@ from verifiers.v1.runtimes.limiters import creation_limiter
 
 logger = logging.getLogger(__name__)
 
-Waiter = asyncio.Future[str | None]
+# A placed member: its sandbox id and generation (None from a gateway that omits it).
+Member = tuple[str, int | None]
+Waiter = asyncio.Future[Member | None]
 
 
 @dataclass(frozen=True)
@@ -65,7 +67,7 @@ class GroupCreates:
         # Gateways that answered they cannot create groups (ranked placement).
         self._unavailable: set[str] = set()
 
-    async def create(self, spec: SandboxSpec, policy: GroupPolicy) -> str | None:
+    async def create(self, spec: SandboxSpec, policy: GroupPolicy) -> Member | None:
         """The group member this create became, or None to create it singly."""
         gateway = os.environ.get("UCLOUD_SANDBOX_URL", "")
         if gateway in self._unavailable:
@@ -97,7 +99,7 @@ class GroupCreates:
                 # Cancelled in the tick after its member arrived.
                 member = waiter.result()
                 if member is not None:
-                    self._spawn(_abandon(member, policy))
+                    self._spawn(_abandon(member[0], policy))
             raise
 
     def _spawn(self, work: Coroutine[object, object, None]) -> None:
@@ -130,7 +132,7 @@ class GroupCreates:
                 waiter = members.get(member.id)
                 if member.placed and waiter is not None and not waiter.done():
                     owned.add(member.id)
-                    waiter.set_result(member.id)
+                    waiter.set_result((member.id, member.generation))
 
         try:
             client = AsyncSandboxClient.from_env(

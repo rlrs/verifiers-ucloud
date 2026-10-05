@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from ucloud_sandboxes_sdk._agent_contract import require_agent_sandbox_record
 from verifiers.v1.errors import SandboxError
 
 from verifiers_ucloud import UCloudRuntime, UCloudRuntimeConfig
@@ -27,6 +28,7 @@ def answer(payload: dict, statuses: list[str], **extra: Any) -> dict:
         member: dict[str, Any] = {"id": f"{group_id}-{index:04d}", "status": status}
         if status == "running":
             member["sandbox"] = {"spec": {"id": member["id"]}}
+            member["generation"] = index + 1
         members.append(member)
     return {
         "group": {"id": group_id, "count": payload["count"], "state": "active"},
@@ -146,6 +148,9 @@ async def test_concurrent_identical_creates_share_one_group(gateway) -> None:
     assert "id" not in batch["spec"] and not gateway.singles()
     group_id = batch["group_id"]
     assert [box.info.id for box in boxes] == [f"{group_id}-{i:04d}" for i in range(3)]
+    # Each member's handle is a managed agent sandbox the relay can bind.
+    for index, box in enumerate(boxes):
+        assert require_agent_sandbox_record(box.sandbox.record, require_generation=True) == index + 1
 
     await asyncio.gather(*(box.stop() for box in boxes))
     deleted = sorted(path for _, path, _ in gateway.calls("DELETE", "/v1/sandboxes/"))
