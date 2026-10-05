@@ -29,10 +29,28 @@ uv sync
 uv run pytest
 ```
 
-The pinned SDK 0.4.26 includes shared relay admission, startup/restore backpressure handling, and separate
-relay connection pools sized for 512 upstream calls, 128 rotating polls, and reply/lease
-control. Forwarding and polling limits can be configured for the upstream service.
-After updating this checkout, run `uv sync` to install the tested SDK.
+The pinned SDK 0.4.35 includes group create, shared relay admission, startup/restore
+backpressure handling, and separate relay connection pools sized for 512 upstream calls,
+128 rotating polls, and reply/lease control. Forwarding and polling limits can be
+configured for the upstream service. After updating this checkout, run `uv sync` to
+install the tested SDK. Until the SDK 0.4.35 release wheel is published, `tool.uv.sources`
+points `uv` at a sibling `ucloud-sandboxes-sdk` checkout.
+
+Rollouts that start together and ask for the same sandbox share one gateway group
+create (`POST /v1/sandboxes:batch`): the gateway packs the members onto few workers, so
+each worker attaches the image once. verifiers starts every rollout's runtime on its own,
+so the runtime coalesces creates of one spec that arrive within
+`group_window_seconds` (0.05 by default) on one event loop, up to `group_max_size` (32)
+per request; `group_placement = "spread"` spreads a group instead of packing it. Each
+rollout takes one member, starts as soon as the gateway places that member, and deletes
+it on teardown as before. A lone rollout, `group_create = false`, and a gateway that
+cannot create groups (ranked placement answers 501) use single creates.
+`creates_per_sec` paces create requests, of which a group create is one. Coalescing is
+per process: an env-server pool dispatches each request to its least-busy worker, which
+can split one example's rollouts across workers.
+
+Each harness file is one upload request; the gateway creates missing parent
+directories.
 
 For 512-way runs, the runner needs headroom for sandbox streams, tool requests,
 relay polls, and upstream connections. On Unix, startup raises the process's

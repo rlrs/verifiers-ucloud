@@ -7,7 +7,6 @@ import contextlib
 import logging
 import shlex
 from collections.abc import AsyncIterator
-from pathlib import PurePosixPath
 from typing import ClassVar, Literal
 
 from pydantic import Field
@@ -29,6 +28,7 @@ from verifiers.v1.runtimes.base import (
 )
 from verifiers.v1.runtimes.limiters import creation_limiter
 
+from ._groups import GroupPolicy, group_creates
 from ._resources import ensure_file_descriptor_capacity
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,15 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
     creates_per_sec: float | None = None
     request_timeout_seconds: float = _DEFAULT_REQUEST_TIMEOUT_SECONDS
     create_timeout_seconds: float = _DEFAULT_CREATE_TIMEOUT_SECONDS
+    group_create: bool = True
+    """Create the sandboxes of rollouts that start together with one spec in one
+    gateway group create. Single creates remain for a lone rollout and for a
+    gateway that cannot create groups."""
+    group_window_seconds: float = Field(0.05, ge=0, le=5)
+    """How long the first create of a spec waits for others to join its group."""
+    group_max_size: int = Field(32, ge=2, le=512)
+    """A group is sent at once when it reaches this size."""
+    group_placement: Literal["pack", "spread"] = "pack"
 
 
 class UCloudRuntimeInfo(UCloudRuntimeConfig, BaseRuntimeInfo):
@@ -126,21 +135,40 @@ class UCloudRuntime(Runtime):
                 ttl_seconds=self.config.ttl_seconds,
                 labels=self.config.labels,
             )
-            async with (
-                creation_limiter(self.config.creates_per_sec, "ucloud-sandbox")
-                or contextlib.nullcontext()
-            ):
-                handle = await self._client.create_sandbox(
-                    spec,
-                    request_timeout_seconds=self.config.create_timeout_seconds,
-                )
-            self.info.id = handle.id
+            member = (
+                await group_creates().create(spec, self._group_policy())
+                if self.config.group_create
+                else None
+            )
+            if member is None:
+                async with (
+                    creation_limiter(self.config.creates_per_sec, "ucloud-sandbox")
+                    or contextlib.nullcontext()
+                ):
+                    handle = await self._client.create_sandbox(
+                        spec,
+                        request_timeout_seconds=self.config.create_timeout_seconds,
+                    )
+                member = handle.id
+            else:
+                logger.debug("ucloud runtime %s is sandbox %s", self.name, member)
+            self.info.id = member
         except Exception as exc:
             client, self._client = self._client, None
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.close()
             raise SandboxError(f"ucloud sandbox provisioning failed: {exc}") from exc
+
+    def _group_policy(self) -> GroupPolicy:
+        return GroupPolicy(
+            window_seconds=self.config.group_window_seconds,
+            max_size=self.config.group_max_size,
+            placement=self.config.group_placement,
+            request_timeout_seconds=self.config.request_timeout_seconds,
+            create_timeout_seconds=self.config.create_timeout_seconds,
+            creates_per_sec=self.config.creates_per_sec,
+        )
 
     async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         if self.info.id is None:
@@ -204,13 +232,11 @@ class UCloudRuntime(Runtime):
     async def write(self, path: str, data: bytes) -> None:
         if self.info.id is None:
             raise SandboxError("ucloud sandbox has no id")
-        target = self._absolute(path)
-        parent = str(PurePosixPath(target).parent)
-        mkdir = await self.run(["mkdir", "-p", parent], {})
-        if mkdir.exit_code != 0:
-            raise SandboxError(f"write {path!r}: {mkdir.stderr.strip()}")
+        # The upload creates missing parent directories: one request per file.
         try:
-            await self._client_or_raise().upload_file(self.info.id, target, data)
+            await self._client_or_raise().upload_file(
+                self.info.id, self._absolute(path), data
+            )
         except Exception as exc:
             raise SandboxError(f"write {path!r}: {exc}") from exc
 
