@@ -29,12 +29,12 @@ uv sync
 uv run pytest
 ```
 
-The pinned SDK 0.4.35 includes group create, shared relay admission, startup/restore
-backpressure handling, and separate relay connection pools sized for 512 upstream calls,
-128 rotating polls, and reply/lease control. Forwarding and polling limits can be
-configured for the upstream service. After updating this checkout, run `uv sync` to
-install the tested SDK. Until the SDK 0.4.35 release wheel is published, `tool.uv.sources`
-points `uv` at a sibling `ucloud-sandboxes-sdk` checkout.
+The pinned SDK 0.4.36 includes archive upload, group create, shared relay admission,
+startup/restore backpressure handling, and separate relay connection pools sized for 512
+upstream calls, 128 rotating polls, and reply/lease control. Forwarding and polling
+limits can be configured for the upstream service. After updating this checkout, run
+`uv sync` to install the tested SDK. Until the SDK 0.4.36 release wheel is published,
+`tool.uv.sources` points `uv` at a sibling `ucloud-sandboxes-sdk` checkout.
 
 Rollouts that start together and ask for the same sandbox share one gateway group
 create (`POST /v1/sandboxes:batch`): the gateway packs the members onto few workers, so
@@ -49,8 +49,10 @@ cannot create groups (ranked placement answers 501) use single creates.
 per process: an env-server pool dispatches each request to its least-busy worker, which
 can split one example's rollouts across workers.
 
-Each harness file is one upload request; the gateway creates missing parent
-directories.
+A single `write` is one upload request; `write_many` (skill folders, MCP and judge
+files) sends all its files in one archive request (`PUT /v1/sandboxes/{id}/archive`).
+Either way the gateway creates missing parent directories and writes each file as 0600.
+A gateway without the archive endpoint gets one upload per file from the SDK.
 
 For 512-way runs, the runner needs headroom for sandbox streams, tool requests,
 relay polls, and upstream connections. On Unix, startup raises the process's

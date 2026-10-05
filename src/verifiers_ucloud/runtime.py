@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 import shlex
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import ClassVar, Literal
 
 from pydantic import Field
@@ -66,6 +66,12 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
 
 class UCloudRuntimeInfo(UCloudRuntimeConfig, BaseRuntimeInfo):
     pass
+
+
+def _same_file_key(path: str) -> str:
+    """The file an absolute path names, compared as the SDK compares archive
+    members. A `..` component stays in the key so the SDK still rejects it."""
+    return "/".join(part for part in path.split("/") if part not in ("", "."))
 
 
 async def _read_stream(reader: asyncio.StreamReader) -> AsyncIterator[bytes]:
@@ -239,6 +245,24 @@ class UCloudRuntime(Runtime):
             )
         except Exception as exc:
             raise SandboxError(f"write {path!r}: {exc}") from exc
+
+    async def write_many(self, files: Mapping[str, bytes]) -> None:
+        # Paths that name one file keep the last data, as sequential writes would.
+        batch: dict[str, tuple[str, bytes]] = {}
+        for path, data in files.items():
+            absolute = self._absolute(path)
+            batch[_same_file_key(absolute)] = (absolute, data)
+        if not batch:
+            return
+        if self.info.id is None:
+            raise SandboxError("ucloud sandbox has no id")
+        # One archive request; the SDK's default mode is the one `write` produces.
+        try:
+            await self._client_or_raise().upload_files(
+                self.info.id, dict(batch.values()), base_dir="/"
+            )
+        except Exception as exc:
+            raise SandboxError(f"write {len(batch)} files: {exc}") from exc
 
     def cleanup(self) -> None:
         sandbox_id = self.info.id

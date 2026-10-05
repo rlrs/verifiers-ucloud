@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from typing import ClassVar, cast
 
 import pytest
+from verifiers.v1.configs.harness import HarnessConfig
 from verifiers.v1.configs.runtime import BaseRuntimeConfig
+from verifiers.v1.errors import SandboxError
+from verifiers.v1.harness import Harness
 from verifiers.v1.interception import (
     BaseInterceptionConfig,
     find_interception_class,
@@ -95,6 +98,8 @@ class _SandboxClient:
         self.execs: list[tuple[str, list[str], dict]] = []
         self.processes: list[tuple[str, list[str], dict, _Process]] = []
         self.uploads: list[tuple[str, str, bytes]] = []
+        self.batches: list[tuple[str, dict[str, bytes], dict]] = []
+        self.batch_error: Exception | None = None
         self.deleted: list[str] = []
         self.closed = False
         self.instances.append(self)
@@ -123,11 +128,24 @@ class _SandboxClient:
     async def upload_file(self, sandbox_id: str, path: str, data: bytes) -> None:
         self.uploads.append((sandbox_id, path, data))
 
+    async def upload_files(self, sandbox_id: str, files, **kwargs) -> dict:
+        self.batches.append((sandbox_id, dict(files), kwargs))
+        if self.batch_error is not None:
+            raise self.batch_error
+        return {"ok": True, "files": len(files)}
+
     async def delete_sandbox(self, sandbox_id: str) -> None:
         self.deleted.append(sandbox_id)
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _SkillsHarness(Harness[HarnessConfig]):
+    SUPPORTS_SKILLS = True
+
+    async def launch(self, *args, **kwargs):
+        raise NotImplementedError
 
 
 class _InterceptionServer:
@@ -253,6 +271,98 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
     await runtime.stop()
     assert client.deleted == ["sandbox-1"]
     assert client.closed
+
+
+async def _started_runtime(monkeypatch) -> tuple[UCloudRuntime, _SandboxClient]:
+    import verifiers_ucloud.runtime as runtime_module
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    runtime = UCloudRuntime(UCloudRuntimeConfig(group_create=False), name="sandbox-1")
+    await runtime.start()
+    return runtime, _SandboxClient.instances[-1]
+
+
+@pytest.mark.asyncio
+async def test_write_many_sends_one_archive_upload(monkeypatch) -> None:
+    runtime, client = await _started_runtime(monkeypatch)
+
+    await runtime.write_many(
+        {
+            "/skills/a/SKILL.md": b"a",
+            "notes/b.txt": b"b",
+            "/app//notes/b.txt": b"last",
+            "/etc/c": b"c",
+        }
+    )
+
+    # Relative paths resolve against the workdir; the last of two paths naming
+    # one file wins, as with sequential writes; the default mode matches `write`.
+    assert client.batches == [
+        (
+            "sandbox-1",
+            {
+                "/skills/a/SKILL.md": b"a",
+                "/app//notes/b.txt": b"last",
+                "/etc/c": b"c",
+            },
+            {"base_dir": "/"},
+        )
+    ]
+    assert client.uploads == []
+
+
+@pytest.mark.asyncio
+async def test_write_many_without_files_sends_nothing(monkeypatch) -> None:
+    runtime, client = await _started_runtime(monkeypatch)
+
+    await runtime.write_many({})
+
+    assert client.batches == []
+    assert client.uploads == []
+
+
+@pytest.mark.asyncio
+async def test_write_many_wraps_errors(monkeypatch) -> None:
+    runtime, client = await _started_runtime(monkeypatch)
+    client.batch_error = ValueError("file path '/a' is a parent directory of '/a/b'")
+
+    with pytest.raises(SandboxError, match=r"write 2 files: .*parent directory"):
+        await runtime.write_many({"/a": b"", "/a/b": b""})
+
+    runtime.info.id = None
+    await runtime.write_many({})
+    with pytest.raises(SandboxError, match="no id"):
+        await runtime.write_many({"/a": b""})
+    assert len(client.batches) == 1
+
+
+@pytest.mark.asyncio
+async def test_install_skills_is_one_archive_upload(monkeypatch, tmp_path) -> None:
+    runtime, client = await _started_runtime(monkeypatch)
+    skill = tmp_path / "alpha"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_bytes(b"alpha")
+    (skill / "scripts" / "run.sh").write_bytes(b"#!/bin/sh\n")
+    (skill / "scripts" / "run.sh").chmod(0o755)
+
+    harness = _SkillsHarness(HarnessConfig(skills=[skill]))
+    await harness.install_skills(runtime, "/skills")
+
+    assert client.batches == [
+        (
+            "sandbox-1",
+            {
+                "/skills/alpha/SKILL.md": b"alpha",
+                "/skills/alpha/scripts/run.sh": b"#!/bin/sh\n",
+            },
+            {"base_dir": "/"},
+        )
+    ]
+    assert client.uploads == []
+    assert [command for _, command, _ in client.execs] == [
+        ["chmod", "+x", "/skills/alpha/scripts/run.sh"]
+    ]
 
 
 @pytest.mark.asyncio
