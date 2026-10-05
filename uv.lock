@@ -2443,7 +2443,11 @@ wheels = [
 
 [[package]]
 name = "ucloud-sandboxes-sdk"
-source = { directory = "../ucloud-sandboxes-sdk" }
+version = "0.4.35"
+source = { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.35/ucloud_sandboxes_sdk-0.4.35-py3-none-any.whl" }
+wheels = [
+    { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.35/ucloud_sandboxes_sdk-0.4.35-py3-none-any.whl", hash = "sha256:795abb4873a8f821d50836a31c19d11c07d4668f6fdfd0200d1ff03ac5800e92" },
+]
 
 [package.optional-dependencies]
 async = [
@@ -2457,14 +2461,6 @@ requires-dist = [
     { name = "inspect-ai", marker = "extra == 'inspect'", specifier = ">=0.3.240,<0.4" },
 ]
 provides-extras = ["async", "inspect"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "aiohttp", specifier = ">=3.10,<4" },
-    { name = "hypothesis", specifier = ">=6,<7" },
-    { name = "inspect-ai", specifier = ">=0.3.240,<0.4" },
-    { name = "ruff", specifier = ">=0.12,<1" },
-]
 
 [[package]]
 name = "urllib3"
@@ -2644,7 +2640,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ucloud-sandboxes-sdk", extras = ["async"], directory = "../ucloud-sandboxes-sdk" },
+    { name = "ucloud-sandboxes-sdk", extras = ["async"], url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.35/ucloud_sandboxes_sdk-0.4.35-py3-none-any.whl" },
     { name = "verifiers", editable = "../verifiers" },
 ]
 
