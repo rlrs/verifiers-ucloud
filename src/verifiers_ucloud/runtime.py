@@ -61,10 +61,7 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
     """How long the first create of a spec waits for others to join its group."""
     group_max_size: int = Field(32, ge=2, le=512)
     """A group is sent at once when it reaches this size."""
-    group_placement: Literal["pack", "spread"] = "spread"
-    """spread: the members share the sampled workers evenly. Faster than pack in
-    the 2026-10-05 production burst (512 as 64 x 8: ready p95 17 s against 26 s,
-    and against 20 s for single creates)."""
+    group_placement: Literal["pack", "spread"] = "pack"
 
 
 class UCloudRuntimeInfo(UCloudRuntimeConfig, BaseRuntimeInfo):

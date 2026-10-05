@@ -37,12 +37,11 @@ install the tested SDK. Until the SDK 0.4.35 release wheel is published, `tool.u
 points `uv` at a sibling `ucloud-sandboxes-sdk` checkout.
 
 Rollouts that start together and ask for the same sandbox share one gateway group
-create (`POST /v1/sandboxes:batch`): the gateway places the members on a few sampled
-workers, and each worker attaches the image once. verifiers starts every rollout's runtime on its own,
+create (`POST /v1/sandboxes:batch`): the gateway packs the members onto few workers, so
+each worker attaches the image once. verifiers starts every rollout's runtime on its own,
 so the runtime coalesces creates of one spec that arrive within
 `group_window_seconds` (0.05 by default) on one event loop, up to `group_max_size` (32)
-per request. `group_placement` is `"spread"` by default, sharing the members evenly
-across the sampled workers; `"pack"` fills one worker first. Each
+per request; `group_placement = "spread"` spreads a group instead of packing it. Each
 rollout takes one member, starts as soon as the gateway places that member, and deletes
 it on teardown as before. A lone rollout, `group_create = false`, and a gateway that
 cannot create groups (ranked placement answers 501) use single creates.

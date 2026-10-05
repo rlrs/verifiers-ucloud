@@ -142,7 +142,7 @@ async def test_concurrent_identical_creates_share_one_group(gateway) -> None:
     await asyncio.gather(*(box.start() for box in boxes))
 
     (batch,) = gateway.batches()
-    assert (batch["count"], batch["placement"]) == (3, "spread")
+    assert (batch["count"], batch["placement"]) == (3, "pack")
     assert "id" not in batch["spec"] and not gateway.singles()
     group_id = batch["group_id"]
     assert [box.info.id for box in boxes] == [f"{group_id}-{i:04d}" for i in range(3)]
