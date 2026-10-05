@@ -40,10 +40,6 @@ select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
 
 [tool.uv.sources]
 verifiers = { path = "../verifiers", editable = true }
-# TODO(sdk-0.4.36): delete this override and run `uv lock` once the v0.4.36
-# release wheel above is published; until then development and tests use the
-# sibling SDK checkout on its archive-upload branch.
-ucloud-sandboxes-sdk = { path = "../ucloud-sandboxes-sdk" }
 
 [tool.uv.exclude-newer-package]
 prime-pydantic-config = false
