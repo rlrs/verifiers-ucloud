@@ -201,7 +201,8 @@ class _RelaySession:
         self.client = client
         self.rollout_id = rollout_id
         self.kwargs = kwargs
-        self.base_url = f"{client.relay_url}/managed/{rollout_id}"
+        # As the SDK's tunnel URL does, this one ends in "/".
+        self.base_url = f"{client.relay_url}/managed/{rollout_id}/"
         self.run_kwargs: dict | None = None
 
     async def __aenter__(self):

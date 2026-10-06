@@ -158,7 +158,9 @@ class UCloudInterception(Interception):
                     await asyncio.sleep(0)
                     try:
                         await self.report_resource_phase(rollout_id, "tool")
-                        yield tunnel.base_url, model_secret, state_secret
+                        # verifiers appends paths (`{base_url}/v1`): the SDK's tunnel
+                        # URL ends in "/", and the relay refuses a "//" endpoint.
+                        yield tunnel.base_url.rstrip("/"), model_secret, state_secret
                     finally:
                         cancel.set()
                         worker.cancel()
