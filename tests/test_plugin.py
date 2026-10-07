@@ -797,3 +797,43 @@ async def test_relay_only_uv_scripts_use_the_toolkit_or_the_offline_bundle(monke
     assert config.network_restricted
     await UCloudRuntime(config, name="relay-only").prepare_uv_script("print(1)")
     assert calls == ["toolkit" if uv_toolkit else "offline"]
+
+
+@pytest.mark.asyncio
+async def test_managed_processes_accept_only_the_configured_uv_toolkit_python(monkeypatch):
+    import verifiers_ucloud.managed_process as managed_module
+    import verifiers_ucloud.runtime as runtime_module
+
+    class ManagedClient(_SandboxClient):
+        async def create_sandbox(self, spec, **kwargs):
+            self.created = spec
+            return SimpleNamespace(id=spec.id, record={"generation": 1, "spec": spec.to_dict()})
+
+    started = []
+
+    async def start_agent(argv, **kwargs):
+        started.append(argv)
+        return SimpleNamespace(sandbox_id="toolkit-agent")
+
+    async def passthrough(operation):
+        return await operation
+
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", ManagedClient)
+    monkeypatch.setattr(managed_module, "with_relay", passthrough)
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(
+            parkable=True, group_create=False, toolkits=["vf-harness:v1"], uv_toolkit="vf-harness"
+        ),
+        name="toolkit-agent",
+    )
+    await runtime.start()
+    try:
+        runtime.info.sandbox_handle.start_agent = start_agent
+        python = "/opt/ucloud/toolkits/vf-harness/uv-cache/environments-v2/acp/bin/python"
+        await runtime.open_process([python, "/tmp/acp.py"], {})
+        assert started[-1][0] == python and started[-1][-2:] == [python, "/tmp/acp.py"]
+        for foreign in ("/opt/ucloud/toolkits/other/bin/python", "/usr/bin/python3"):
+            with pytest.raises(Exception, match="staged portable Python"):
+                await runtime.open_process([foreign, "/tmp/acp.py"], {})
+    finally:
+        await runtime.stop()

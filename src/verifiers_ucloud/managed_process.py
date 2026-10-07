@@ -55,8 +55,12 @@ class ManagedProcess(RuntimeProcess):
         if handle is None:
             raise SandboxError("Managed process requires a validated parkable sandbox")
         mailbox = f"/tmp/vf-managed-{uuid.uuid4().hex}"
-        # ACP's prepared argv starts with the pinned portable Python interpreter.
-        if not argv or not argv[0].startswith("/opt/verifiers-offline/"):
+        # ACP's prepared argv starts with the pinned portable Python interpreter:
+        # the staged offline bundle, or the configured uv toolkit's environment.
+        prefixes = ["/opt/verifiers-offline/"]
+        if runtime.config.uv_toolkit is not None:
+            prefixes.append(f"/opt/ucloud/toolkits/{runtime.config.uv_toolkit}/")
+        if not argv or not argv[0].startswith(tuple(prefixes)):
             raise SandboxError(
                 "Managed interactive processes require staged portable Python"
             )
