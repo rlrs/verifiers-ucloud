@@ -7,6 +7,7 @@ import contextlib
 import logging
 import shlex
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from typing import ClassVar, Literal
 
 from pydantic import Field
@@ -66,6 +67,10 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
     """A group is sent at once when it reaches this size."""
     group_placement: Literal["pack", "spread"] = "pack"
     managed_agent: bool = True
+    toolkits: list[str] = Field(default_factory=list, max_length=4)
+    """Read-only toolkits stacked on the image (``name:tag``): their files are under
+    ``/opt/ucloud/toolkits/<name>``. Point the harness at one through its own env
+    (``UV_INSTALL_DIR`` and friends), so task commands keep the image's tools."""
     """Run the rollout's main program (`run_program`) as the sandbox's managed
     primary process in a parkable sandbox. The gateway then knows the rollout's
     model calls as waits, pausing or parking the sandbox through them, and charges
@@ -202,6 +207,12 @@ class UCloudRuntime(Runtime):
             ttl_seconds=self.config.ttl_seconds,
             labels=self.config.labels,
         )
+        spec = self._base_spec(common)
+        if not self.config.toolkits:
+            return spec
+        return replace(spec, toolkits=tuple(self.config.toolkits))
+
+    def _base_spec(self, common: dict) -> SandboxSpec:
         if not self.config.managed_agent:
             return SandboxSpec.benchmark(**common)
         # A managed primary needs the container profile. Its security matches

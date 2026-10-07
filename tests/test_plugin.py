@@ -273,6 +273,7 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
     assert spec["cpus"] == 2
     assert spec["memory_mb"] == 4096
     assert spec["disk_mb"] == 8192
+    assert "toolkits" not in spec  # None asked for: the request is unchanged.
     assert spec["env"] == {"RUNTIME": "yes"}
     assert client.create_kwargs == {"request_timeout_seconds": 900.0}
 
@@ -544,3 +545,12 @@ async def test_resource_phase_hints_are_optional_fenced_and_non_authoritative(
         assert _RelayClient.instances[-1].unregistered == ["phase-run"]
     finally:
         await interception.stop()
+
+
+def test_toolkits_reach_the_sandbox_spec_in_both_sandbox_shapes() -> None:
+    for managed in (True, False):
+        runtime = UCloudRuntime(
+            UCloudRuntimeConfig(toolkits=["vf-harness:v1"], managed_agent=managed),
+            name="sandbox-1",
+        )
+        assert runtime._spec().to_dict()["toolkits"] == ["vf-harness:v1"]
