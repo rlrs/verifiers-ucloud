@@ -250,6 +250,7 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch, image_kind) -> No
     assert spec["memory_mb"] == 4096
     assert spec["disk_mb"] == 8192
     assert spec["env"] == {"RUNTIME": "yes"}
+    assert "toolkits" not in spec  # None asked for: the request is unchanged.
     assert client.create_kwargs == {"request_timeout_seconds": 900.0}
 
     result = await runtime.run(["echo", "ok"], {"CALL": "yes"})
@@ -733,3 +734,66 @@ async def test_confirmed_image_failure_keeps_its_type(monkeypatch, tmp_path, kin
     with pytest.raises(error_type, match="confirmed failed recipe"):
         await runtime.start()
     assert runtime.info.id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parkable", [False, True])
+async def test_toolkits_reach_the_sandbox_spec_in_both_sandbox_shapes(monkeypatch, parkable):
+    import verifiers_ucloud.runtime as runtime_module
+
+    class ManagedClient(_SandboxClient):
+        async def create_sandbox(self, spec, **kwargs):
+            self.created = spec
+            return SimpleNamespace(id=spec.id, record={"generation": 1, "spec": spec.to_dict()})
+
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", ManagedClient)
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(toolkits=["vf-harness:v1"], parkable=parkable, group_create=False),
+        name="toolkit-probe",
+    )
+    await runtime.start()
+    try:
+        client = ManagedClient.instances[-1]
+        assert client.created.to_dict()["toolkits"] == ["vf-harness:v1"]
+    finally:
+        await runtime.stop()
+
+
+def test_a_uv_toolkit_prepares_uv_scripts_and_must_be_requested() -> None:
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(toolkits=["vf-harness:v1"], uv_toolkit="vf-harness"),
+        name="sandbox-1",
+    )
+    assert runtime.uv_env["UV_INSTALL_DIR"] == "/opt/ucloud/toolkits/vf-harness/bin"
+    assert runtime.uv_env["UV_PYTHON_PREFERENCE"] == "only-managed"
+    assert runtime.env == {}  # Task commands see none of it.
+    assert UCloudRuntime(UCloudRuntimeConfig(), name="s").uv_env == {}
+    with pytest.raises(ValueError, match="uv_toolkit"):
+        UCloudRuntimeConfig(uv_toolkit="vf-harness")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uv_toolkit", [None, "vf-harness"])
+async def test_relay_only_uv_scripts_use_the_toolkit_or_the_offline_bundle(monkeypatch, uv_toolkit):
+    import verifiers_ucloud.offline as offline_module
+
+    calls = []
+
+    async def framework(self, script, env=None, *, activate=True):
+        calls.append("toolkit")
+        return ["python", "script.py"]
+
+    async def offline(runtime, script, env=None, *, activate=True):
+        calls.append("offline")
+        return ["python", "script.py"]
+
+    monkeypatch.setattr(Runtime, "prepare_uv_script", framework)
+    monkeypatch.setattr(offline_module, "prepare_script", offline)
+    config = UCloudRuntimeConfig(
+        allow=[],
+        toolkits=["vf-harness:v1"] if uv_toolkit else [],
+        uv_toolkit=uv_toolkit,
+    )
+    assert config.network_restricted
+    await UCloudRuntime(config, name="relay-only").prepare_uv_script("print(1)")
+    assert calls == ["toolkit" if uv_toolkit else "offline"]

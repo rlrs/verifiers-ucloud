@@ -56,6 +56,15 @@ cannot create groups (ranked placement answers 501) use single creates.
 per process: an env-server pool dispatches each request to its least-busy worker, which
 can split one example's rollouts across workers.
 
+`toolkits = ["name:tag", ...]` (at most four) asks the gateway to stack read-only
+toolkits on the image under `/opt/ucloud/toolkits/<name>`; requests without toolkits are
+unchanged. `uv_toolkit = "<name>"` names one of them whose prebuilt uv, managed Python
+and uv cache prepare every harness and task uv script through `Runtime.uv_env`, which
+task commands never see. This needs a verifiers with `Runtime.uv_env`, and it replaces
+the offline Python bundle for uv scripts in relay-only sandboxes. A toolkit is built for
+one verifiers commit and its exact harness scripts: a script it did not prebuild needs
+the network, which a relay-only sandbox does not have.
+
 A single `write` is one upload request; `write_many` (skill folders, MCP and judge
 files) sends all its files in one archive request (`PUT /v1/sandboxes/{id}/archive`).
 Either way the gateway creates missing parent directories and writes each file as 0600.

@@ -7,6 +7,7 @@ from .image_builds import ImageBuildFailure, ImageBuildPollingError
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import json
 import os
@@ -85,6 +86,13 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     image_build_cache: Path | None = None
     guest_relay_url: str | None = None
     relay_name: str = Field(default="default", pattern=r"^[a-z][a-z0-9-]{0,31}$")
+    toolkits: list[str] = Field(default_factory=list, max_length=4)
+    """Read-only toolkits the gateway stacks on the image (``name:tag`` or
+    ``name@sha256:<root>``); their files are under ``/opt/ucloud/toolkits/<name>``."""
+    uv_toolkit: str | None = None
+    """The toolkit (one of ``toolkits``, by name) whose prebuilt uv, Python and script
+    environments prepare every harness and task uv script, also in relay-only
+    sandboxes. Task commands keep the image's own tools."""
 
     @model_validator(mode="after")
     def validate_relay_policy(self):
@@ -93,6 +101,9 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
                 raise ValueError("UCloud supports framework-only relay access, not custom allow/block lists")
             if not self.network_access:
                 raise ValueError("Framework-only UCloud access requires bridge transport for the relay")
+        names = [ref.split("@")[0].split(":")[0] for ref in self.toolkits]
+        if self.uv_toolkit is not None and self.uv_toolkit not in names:
+            raise ValueError("uv_toolkit must name one of the requested toolkits")
         return self
     cpu: float = 1.0
     memory: float = 2.0
@@ -165,6 +176,16 @@ class UCloudRuntime(Runtime):
         self.config = config
         self.info = UCloudRuntimeInfo(**config.model_dump())
         self._client: AsyncSandboxClient | None = None
+        if config.uv_toolkit is not None:
+            if not hasattr(self, "uv_env"):
+                raise SandboxError("uv_toolkit needs a verifiers with Runtime.uv_env")
+            root = f"/opt/ucloud/toolkits/{config.uv_toolkit}"
+            self.uv_env = {
+                "UV_INSTALL_DIR": f"{root}/bin",
+                "UV_CACHE_DIR": f"{root}/uv-cache",
+                "UV_PYTHON_INSTALL_DIR": f"{root}/python",
+                "UV_PYTHON_PREFERENCE": "only-managed",
+            }
         self._offline_setup_lock = asyncio.Lock()
         self._offline_prefix: str | None = None
 
@@ -226,6 +247,8 @@ class UCloudRuntime(Runtime):
                 ttl_seconds=self.config.ttl_seconds,
                 labels=self.config.labels,
             )
+            if self.config.toolkits:
+                spec = dataclasses.replace(spec, toolkits=tuple(self.config.toolkits))
             member = (
                 await group_creates().create(spec, self._group_policy())
                 if self.config.group_create
@@ -305,7 +328,8 @@ class UCloudRuntime(Runtime):
         return super().host_url(url)
 
     async def prepare_uv_script(self, script, env=None, *, activate=True):
-        if not self.network_restricted:
+        # A uv toolkit's prebuilt environments prepare scripts without the network.
+        if not self.network_restricted or self.config.uv_toolkit is not None:
             return await super().prepare_uv_script(script, env, activate=activate)
         from .offline import prepare_script
         return await prepare_script(self, script, env, activate=activate)
