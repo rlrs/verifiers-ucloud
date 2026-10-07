@@ -554,3 +554,16 @@ def test_toolkits_reach_the_sandbox_spec_in_both_sandbox_shapes() -> None:
             name="sandbox-1",
         )
         assert runtime._spec().to_dict()["toolkits"] == ["vf-harness:v1"]
+
+
+def test_a_uv_toolkit_prepares_uv_scripts_and_must_be_requested() -> None:
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(toolkits=["vf-harness:v1"], uv_toolkit="vf-harness"),
+        name="sandbox-1",
+    )
+    assert runtime.uv_env["UV_INSTALL_DIR"] == "/opt/ucloud/toolkits/vf-harness/bin"
+    assert runtime.uv_env["UV_PYTHON_PREFERENCE"] == "only-managed"
+    assert runtime.env == {}  # Task commands see none of it.
+    assert UCloudRuntime(UCloudRuntimeConfig(), name="s").uv_env == {}
+    with pytest.raises(ValueError, match="uv_toolkit"):
+        UCloudRuntimeConfig(uv_toolkit="vf-harness")

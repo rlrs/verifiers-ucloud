@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from typing import ClassVar, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from ucloud_sandboxes_sdk import (
     AsyncJobHandle,
     AsyncSandboxClient,
@@ -69,8 +69,18 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
     managed_agent: bool = True
     toolkits: list[str] = Field(default_factory=list, max_length=4)
     """Read-only toolkits stacked on the image (``name:tag``): their files are under
-    ``/opt/ucloud/toolkits/<name>``. Point the harness at one through its own env
-    (``UV_INSTALL_DIR`` and friends), so task commands keep the image's tools."""
+    ``/opt/ucloud/toolkits/<name>``."""
+    uv_toolkit: str | None = None
+    """The toolkit (one of ``toolkits``, by name) whose prebuilt uv, Python and script
+    environments prepare every harness and task uv script. Task commands keep the
+    image's own tools."""
+
+    @model_validator(mode="after")
+    def _uv_toolkit_is_requested(self) -> UCloudRuntimeConfig:
+        names = [ref.split("@")[0].split(":")[0] for ref in self.toolkits]
+        if self.uv_toolkit is not None and self.uv_toolkit not in names:
+            raise ValueError("uv_toolkit must name one of the requested toolkits")
+        return self
     """Run the rollout's main program (`run_program`) as the sandbox's managed
     primary process in a parkable sandbox. The gateway then knows the rollout's
     model calls as waits, pausing or parking the sandbox through them, and charges
@@ -145,6 +155,14 @@ class UCloudRuntime(Runtime):
         self.info = UCloudRuntimeInfo(**config.model_dump())
         self._client: AsyncSandboxClient | None = None
         self.sandbox: AsyncSandboxHandle | None = None
+        if config.uv_toolkit is not None:
+            root = f"/opt/ucloud/toolkits/{config.uv_toolkit}"
+            self.uv_env = {
+                "UV_INSTALL_DIR": f"{root}/bin",
+                "UV_CACHE_DIR": f"{root}/uv-cache",
+                "UV_PYTHON_INSTALL_DIR": f"{root}/python",
+                "UV_PYTHON_PREFERENCE": "only-managed",
+            }
         """The started sandbox; interception binds the rollout's relay session to it."""
 
     def _client_or_raise(self) -> AsyncSandboxClient:
