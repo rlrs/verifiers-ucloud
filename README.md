@@ -35,6 +35,32 @@ Normalize this join boundary so requests do not contain `//v1`, which the relay
 rejects as a non-absolute endpoint. The interception lifecycle test uses the SDK's
 trailing-slash convention.
 
+The pinned SDK 0.4.36 includes archive upload, group create, shared relay admission,
+startup/restore backpressure handling, and separate relay connection pools sized for 512
+upstream calls, 128 rotating polls, and reply/lease control. Forwarding and polling
+limits can be configured for the upstream service. After updating this checkout, run
+`uv sync` to install the tested SDK.
+
+Rollouts that start together and ask for the same sandbox share one gateway group
+create (`POST /v1/sandboxes:batch`): the gateway packs the members onto few workers, so
+each worker attaches the image once. verifiers starts every rollout's runtime on its own,
+so the runtime coalesces creates of one spec that arrive within
+`group_window_seconds` (0.05 by default) on one event loop, up to `group_max_size` (32)
+per request; `group_placement = "spread"` spreads a group instead of packing it. Each
+rollout takes one member, starts as soon as the gateway places that member, and deletes
+it on teardown as before. A parkable managed sandbox created in a group passes the same
+checks as a single create: the member's record must show a parkable managed process and
+a positive generation. A lone rollout, `group_create = false`, and a gateway that
+cannot create groups (ranked placement answers 501) use single creates.
+`creates_per_sec` paces create requests, of which a group create is one. Coalescing is
+per process: an env-server pool dispatches each request to its least-busy worker, which
+can split one example's rollouts across workers.
+
+A single `write` is one upload request; `write_many` (skill folders, MCP and judge
+files) sends all its files in one archive request (`PUT /v1/sandboxes/{id}/archive`).
+Either way the gateway creates missing parent directories and writes each file as 0600.
+A gateway without the archive endpoint gets one upload per file from the SDK.
+
 This isolated checkout also restores standard localhost entries when the sandbox
 cannot resolve localhost. The current gateway supplied empty /etc/hosts files,
 breaking PostgreSQL, local HTTP tests, and pytest-rerunfailures' loopback socket.

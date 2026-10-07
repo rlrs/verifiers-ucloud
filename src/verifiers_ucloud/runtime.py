@@ -12,17 +12,19 @@ import json
 import os
 from urllib.parse import urlsplit, urlunsplit
 import shlex
+from collections.abc import Mapping
 
 from .supervision import with_relay
 from .recovery import SandboxNodeLost, is_node_lost
 from verifiers.v1.errors import TunnelError
 from collections.abc import AsyncIterator
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 from pydantic import Field, model_validator
 from ucloud_sandboxes_sdk import (
     AsyncSandboxClient,
+    AsyncSandboxHandle,
     AsyncSandboxProcess,
     Image,
     SandboxClient,
@@ -42,6 +44,8 @@ from verifiers.v1.runtimes.base import (
     parse_gpu,
 )
 from verifiers.v1.runtimes.limiters import creation_limiter
+
+from ._groups import GroupPolicy, group_creates
 
 logger = logging.getLogger(__name__)
 
@@ -100,11 +104,26 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     creates_per_sec: float | None = None
     request_timeout_seconds: float = _DEFAULT_REQUEST_TIMEOUT_SECONDS
     create_timeout_seconds: float = _DEFAULT_CREATE_TIMEOUT_SECONDS
+    group_create: bool = True
+    """Create the sandboxes of rollouts that start together with one spec in one
+    gateway group create. Single creates remain for a lone rollout and for a
+    gateway that cannot create groups."""
+    group_window_seconds: float = Field(0.05, ge=0, le=5)
+    """How long the first create of a spec waits for others to join its group."""
+    group_max_size: int = Field(32, ge=2, le=512)
+    """A group is sent at once when it reaches this size."""
+    group_placement: Literal["pack", "spread"] = "pack"
 
 
 class UCloudRuntimeInfo(UCloudRuntimeConfig, BaseRuntimeInfo):
     sandbox_generation: int | None = None
     sandbox_handle: Any = Field(default=None, exclude=True, repr=False)
+
+
+def _same_file_key(path: str) -> str:
+    """The file an absolute path names, compared as the SDK compares archive
+    members. A `..` component stays in the key so the SDK still rejects it."""
+    return "/".join(part for part in path.split("/") if part not in ("", "."))
 
 
 async def _read_stream(reader: asyncio.StreamReader) -> AsyncIterator[bytes]:
@@ -207,14 +226,26 @@ class UCloudRuntime(Runtime):
                 ttl_seconds=self.config.ttl_seconds,
                 labels=self.config.labels,
             )
-            async with (
-                creation_limiter(self.config.creates_per_sec, "ucloud-sandbox")
-                or contextlib.nullcontext()
-            ):
-                handle = await self._client.create_sandbox(
-                    spec,
-                    request_timeout_seconds=self.config.create_timeout_seconds,
-                )
+            member = (
+                await group_creates().create(spec, self._group_policy())
+                if self.config.group_create
+                else None
+            )
+            if member is None:
+                async with (
+                    creation_limiter(self.config.creates_per_sec, "ucloud-sandbox")
+                    or contextlib.nullcontext()
+                ):
+                    handle = await self._client.create_sandbox(
+                        spec,
+                        request_timeout_seconds=self.config.create_timeout_seconds,
+                    )
+            else:
+                logger.debug("ucloud runtime %s is sandbox %s", self.name, member.id)
+                record = dict(member.record)
+                if member.generation is not None:
+                    record.setdefault("generation", member.generation)
+                handle = AsyncSandboxHandle(client=self._client, id=member.id, record=record)
             self.info.id = handle.id
             if self.config.parkable:
                 record = handle.record
@@ -291,6 +322,16 @@ class UCloudRuntime(Runtime):
         if not relay.hostname or any(origin(route) != origin(relay.geturl()) for route in routes):
             raise SandboxError("Framework route is outside the configured UCloud relay origin")
         # The gateway enforces the named relay policy from sandbox creation onward.
+
+    def _group_policy(self) -> GroupPolicy:
+        return GroupPolicy(
+            window_seconds=self.config.group_window_seconds,
+            max_size=self.config.group_max_size,
+            placement=self.config.group_placement,
+            request_timeout_seconds=self.config.request_timeout_seconds,
+            create_timeout_seconds=self.config.create_timeout_seconds,
+            creates_per_sec=self.config.creates_per_sec,
+        )
 
     async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         if self.info.id is None:
@@ -405,17 +446,34 @@ class UCloudRuntime(Runtime):
     async def write(self, path: str, data: bytes) -> None:
         if self.info.id is None:
             raise SandboxError("ucloud sandbox has no id")
-        target = self._absolute(path)
-        parent = str(PurePosixPath(target).parent)
-        mkdir = await self.run(["mkdir", "-p", parent], {})
-        if mkdir.exit_code != 0:
-            raise SandboxError(f"write {path!r}: {mkdir.stderr.strip()}")
+        # The upload creates missing parent directories: one request per file.
         try:
+            target = self._absolute(path)
             await _retry_file_admission(lambda: self._client_or_raise().upload_file(self.info.id, target, data))
         except Exception as exc:
             if isinstance(exc, SandboxNodeLost) or is_node_lost(exc):
                 raise SandboxNodeLost(f"node_lost: {exc}") from exc
             raise SandboxError(f"write {path!r}: {exc}") from exc
+
+    async def write_many(self, files: Mapping[str, bytes]) -> None:
+        # Paths that name one file keep the last data, as sequential writes would.
+        batch: dict[str, tuple[str, bytes]] = {}
+        for path, data in files.items():
+            absolute = self._absolute(path)
+            batch[_same_file_key(absolute)] = (absolute, data)
+        if not batch:
+            return
+        if self.info.id is None:
+            raise SandboxError("ucloud sandbox has no id")
+        # One archive request; the SDK's default mode is the one `write` produces.
+        try:
+            await _retry_file_admission(lambda: self._client_or_raise().upload_files(
+                self.info.id, dict(batch.values()), base_dir="/"
+            ))
+        except Exception as exc:
+            if isinstance(exc, SandboxNodeLost) or is_node_lost(exc):
+                raise SandboxNodeLost(f"node_lost: {exc}") from exc
+            raise SandboxError(f"write {len(batch)} files: {exc}") from exc
 
     def cleanup(self) -> None:
         sandbox_id = self.info.id
