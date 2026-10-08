@@ -150,7 +150,10 @@ async def test_concurrent_identical_creates_share_one_group(gateway) -> None:
     assert [box.info.id for box in boxes] == [f"{group_id}-{i:04d}" for i in range(3)]
     # Each member's handle is a managed agent sandbox the relay can bind.
     for index, box in enumerate(boxes):
-        assert require_agent_sandbox_record(box.sandbox.record, require_generation=True) == index + 1
+        generation = require_agent_sandbox_record(
+            box.sandbox.record, require_generation=True
+        )
+        assert generation == index + 1
 
     await asyncio.gather(*(box.stop() for box in boxes))
     deleted = sorted(path for _, path, _ in gateway.calls("DELETE", "/v1/sandboxes/"))

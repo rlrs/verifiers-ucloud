@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.12' and sys_platform == 'win32'",
@@ -13,9 +13,9 @@ resolution-markers = [
 [options]
 
 [options.exclude-newer-package]
+prime-tunnel = false
 prime-pydantic-config = false
 prime-sandboxes = false
-prime-tunnel = false
 renderers = false
 
 [[package]]
@@ -617,8 +617,8 @@ name = "httpcore2"
 version = "2.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "h11" },
-    { name = "truststore" },
+    { name = "h11", marker = "sys_platform != 'emscripten'" },
+    { name = "truststore", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/be/ad/f4f0e57345f1870f3e8cb624e058d7eca6e5a27d33bcc3311d9b618734cd/httpcore2-2.12.0.tar.gz", hash = "sha256:9293522bba0aa7c4c8e9e3f040c16575bd8868e155a77fa30c7a9085a5eae648", size = 67548, upload-time = "2026-08-18T13:22:08.211Z" }
 wheels = [
@@ -2443,10 +2443,10 @@ wheels = [
 
 [[package]]
 name = "ucloud-sandboxes-sdk"
-version = "0.4.36"
-source = { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.36/ucloud_sandboxes_sdk-0.4.36-py3-none-any.whl" }
+version = "0.4.37"
+source = { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.37/ucloud_sandboxes_sdk-0.4.37-py3-none-any.whl" }
 wheels = [
-    { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.36/ucloud_sandboxes_sdk-0.4.36-py3-none-any.whl", hash = "sha256:f7a74fae01b3b45ebc00fa5777809bd597f80413149ad3d1bba5b51959108044" },
+    { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.37/ucloud_sandboxes_sdk-0.4.37-py3-none-any.whl", hash = "sha256:63321d13ec52347526a341871eec2167279b5d2a3e672e893f56725bb584d04f" },
 ]
 
 [package.optional-dependencies]
@@ -2476,8 +2476,8 @@ name = "uvicorn"
 version = "0.52.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "h11" },
+    { name = "click", marker = "sys_platform != 'emscripten'" },
+    { name = "h11", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/f2/0f/3f86e61397dd33bf2ccf28188c40db6a740658aeebbbf6e7dbc101a1f487/uvicorn-0.52.4.tar.gz", hash = "sha256:73acfee47a0b133c5de13d219492d62d8a31e935f4fe6e41a232451a15379f86", size = 100627, upload-time = "2026-08-19T06:27:41.821Z" }
 wheels = [
@@ -2640,7 +2640,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ucloud-sandboxes-sdk", extras = ["async"], url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.36/ucloud_sandboxes_sdk-0.4.36-py3-none-any.whl" },
+    { name = "ucloud-sandboxes-sdk", extras = ["async"], url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.37/ucloud_sandboxes_sdk-0.4.37-py3-none-any.whl" },
     { name = "verifiers", editable = "../verifiers" },
 ]
 

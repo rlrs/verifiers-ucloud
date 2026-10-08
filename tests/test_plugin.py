@@ -283,10 +283,12 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
 
     # The rollout's main program is the sandbox's managed primary, not an exec.
     program = await runtime.run_program(["harness", "--go"], {"MAIN": "yes"})
-    assert (program.exit_code, program.stdout, program.stderr) == (3, "agent out", "agent err")
+    result = (program.exit_code, program.stdout, program.stderr)
+    assert result == (3, "agent out", "agent err")
     job = runtime.sandbox.jobs[-1]
     assert job.argv == ["harness", "--go"]
-    assert job.kwargs == {"env": {"RUNTIME": "yes", "MAIN": "yes"}, "working_dir": "/app"}
+    env = {"RUNTIME": "yes", "MAIN": "yes"}
+    assert job.kwargs == {"env": env, "working_dir": "/app"}
     assert job.wait_kwargs == {"poll_seconds": 2.0}
     assert len(client.execs) == 1
 

@@ -29,12 +29,11 @@ uv sync
 uv run pytest
 ```
 
-The pinned SDK 0.4.36 includes archive upload, group create, shared relay admission,
-startup/restore backpressure handling, and separate relay connection pools sized for 512
-upstream calls, 128 rotating polls, and reply/lease control. Forwarding and polling
-limits can be configured for the upstream service. After updating this checkout, run
-`uv sync` to install the tested SDK. Until the SDK 0.4.36 release wheel is published,
-`tool.uv.sources` points `uv` at a sibling `ucloud-sandboxes-sdk` checkout.
+The pinned SDK 0.4.37 includes toolkits, image recipes, archive upload, group create,
+shared relay admission, startup/restore backpressure handling, and separate relay
+connection pools sized for 512 upstream calls, 128 rotating polls, and reply/lease
+control. Forwarding and polling limits can be configured for the upstream service.
+After updating this checkout, run `uv sync` to install the tested SDK.
 
 Rollouts that start together and ask for the same sandbox share one gateway group
 create (`POST /v1/sandboxes:batch`): the gateway packs the members onto few workers, so
@@ -57,6 +56,14 @@ sandbox's wait: it pauses or parks the sandbox through the wait and charges disk
 the sandbox writes. Needs a verifiers that passes the runtime to
 `Interception.acquire`; with an older one the session stays unbound. Set
 `managed_agent = false` for a `linux_host` sandbox that runs the program as one exec.
+
+`toolkits = ["vf-harness:latest"]` asks the gateway to stack read-only toolkits (at most
+4) on each rollout's image under `/opt/ucloud/toolkits/<name>`. `uv_toolkit` names one
+of them whose uv, managed Python and prebuilt script environments verifiers uses to
+prepare harness and task uv scripts (`Runtime.uv_env`), instead of installing them per
+rollout; task commands keep the image's own tools. The toolkit is built by
+`runtime/toolkits/vf-harness/build.sh` in `ucloud-sandboxes`. `uv_toolkit` needs a
+verifiers with `Runtime.uv_env`.
 
 A single `write` is one upload request; `write_many` (skill folders, MCP and judge
 files) sends all its files in one archive request (`PUT /v1/sandboxes/{id}/archive`).
