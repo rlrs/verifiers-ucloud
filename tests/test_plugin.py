@@ -569,3 +569,35 @@ def test_a_uv_toolkit_prepares_uv_scripts_and_must_be_requested() -> None:
     assert UCloudRuntime(UCloudRuntimeConfig(), name="s").uv_env == {}
     with pytest.raises(ValueError, match="uv_toolkit"):
         UCloudRuntimeConfig(uv_toolkit="vf-harness")
+
+
+def test_unknown_runtime_and_interception_settings_are_rejected() -> None:
+    with pytest.raises(ValueError, match="parkable"):
+        UCloudRuntimeConfig(parkable=True)
+    with pytest.raises(ValueError, match="no_such_setting"):
+        UCloudInterceptionConfig(no_such_setting=1)
+
+
+@pytest.mark.asyncio
+async def test_bounded_reads_use_the_verifiers_capped_read(monkeypatch) -> None:
+    from verifiers.v1.runtimes.base import Runtime
+
+    import verifiers_ucloud.runtime as runtime_module
+
+    capped = []
+
+    async def capped_read(self, path, max_bytes=None):
+        capped.append((path, max_bytes))
+        return b"x" * 3
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    monkeypatch.setattr(Runtime, "_read", capped_read)
+    runtime = UCloudRuntime(UCloudRuntimeConfig(group_create=False), name="sandbox-1")
+    await runtime.start()
+    try:
+        assert await runtime.read("log.txt", max_bytes=10) == b"xxx"
+        assert capped == [("log.txt", 11)]  # verifiers asks for one extra byte
+        assert await runtime.read("log.txt") == b"sandbox-1:/app/log.txt"
+    finally:
+        await runtime.stop()

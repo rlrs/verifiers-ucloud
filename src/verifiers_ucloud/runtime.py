@@ -67,6 +67,13 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
     """A group is sent at once when it reaches this size."""
     group_placement: Literal["pack", "spread"] = "pack"
     managed_agent: bool = True
+    """Run the rollout's main program (`run_program`) as the sandbox's managed
+    primary process in a parkable sandbox. The gateway then knows the rollout's
+    model calls as waits, pausing or parking the sandbox through them, and charges
+    disk by what it writes. False keeps a `linux_host` sandbox that runs the
+    program as one exec."""
+    agent_poll_seconds: float = Field(2.0, gt=0)
+    """How often a waiting `run_program` asks whether its managed program ended."""
     toolkits: list[str] = Field(default_factory=list, max_length=4)
     """Read-only toolkits stacked on the image (``name:tag``): their files are under
     ``/opt/ucloud/toolkits/<name>``."""
@@ -81,13 +88,6 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
         if self.uv_toolkit is not None and self.uv_toolkit not in names:
             raise ValueError("uv_toolkit must name one of the requested toolkits")
         return self
-    """Run the rollout's main program (`run_program`) as the sandbox's managed
-    primary process in a parkable sandbox. The gateway then knows the rollout's
-    model calls as waits, pausing or parking the sandbox through them, and charges
-    disk by what it writes. False keeps a `linux_host` sandbox that runs the
-    program as one exec."""
-    agent_poll_seconds: float = Field(2.0, gt=0)
-    """How often a waiting `run_program` asks whether its managed program ended."""
 
 
 class UCloudRuntimeInfo(UCloudRuntimeConfig, BaseRuntimeInfo):
@@ -155,6 +155,7 @@ class UCloudRuntime(Runtime):
         self.info = UCloudRuntimeInfo(**config.model_dump())
         self._client: AsyncSandboxClient | None = None
         self.sandbox: AsyncSandboxHandle | None = None
+        """The started sandbox; interception binds the rollout's relay session to it."""
         if config.uv_toolkit is not None:
             root = f"/opt/ucloud/toolkits/{config.uv_toolkit}"
             self.uv_env = {
@@ -163,7 +164,6 @@ class UCloudRuntime(Runtime):
                 "UV_PYTHON_INSTALL_DIR": f"{root}/python",
                 "UV_PYTHON_PREFERENCE": "only-managed",
             }
-        """The started sandbox; interception binds the rollout's relay session to it."""
 
     def _client_or_raise(self) -> AsyncSandboxClient:
         if self._client is None:
@@ -331,7 +331,10 @@ class UCloudRuntime(Runtime):
             return path
         return f"{self.config.workdir.rstrip('/')}/{path}"
 
-    async def _read(self, path: str) -> bytes:
+    async def _read(self, path: str, max_bytes: int | None = None) -> bytes:
+        if max_bytes is not None:
+            # verifiers enforces the cap inside the sandbox before transferring.
+            return await super()._read(path, max_bytes=max_bytes)
         if self.info.id is None:
             raise SandboxError("ucloud sandbox has no id")
         try:
