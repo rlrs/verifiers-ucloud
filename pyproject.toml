@@ -11,8 +11,10 @@ license = "MIT"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.37/ucloud_sandboxes_sdk-0.4.37-py3-none-any.whl",
-    # The rlrs fork: upstream verifiers plus the runtime-provider hooks this package uses.
-    "verifiers @ git+https://github.com/rlrs/verifiers@v0.2.1.post1",
+    # The rlrs fork: upstream verifiers plus the runtime-provider hooks this package
+    # uses and the harnesses LUMI RL trains with. Branch feat/lumi-harnesses-20261009;
+    # replace the commit with its release tag.
+    "verifiers @ git+https://github.com/rlrs/verifiers@1702110b2cadd99685f87cf3014685b22294d13d",
 ]
 
 [dependency-groups]

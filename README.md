@@ -76,6 +76,37 @@ the sandbox writes. Needs a verifiers that passes the runtime to
 `Interception.acquire`; with an older one the session stays unbound. Set
 `managed_agent = false` for a `linux_host` sandbox that runs the program as one exec.
 
+`park_interactive = true` parks live processes too: `open_process` (an ACP agent such as
+OpenCode or Pi) runs as a managed job behind a small bridge, with stdin through a mailbox
+directory and stdout/stderr from the job's logs, so the sandbox parks while the agent
+waits for the model instead of holding a live exec. The process's interpreter must be a
+staged offline Python or the `uv_toolkit`'s.
+
+`image_reference_type = "name"` sends `image` as a gateway image name instead of a
+registry reference: name an image recipe registered with the SDK's
+`register_image_recipes`, and the sandbox waits for its build.
+
+**Relay-only sandboxes.** `allow = []` (verifiers' framework-only policy) asks the gateway
+for the named relay policy (`relay_name`, default `default`) from creation: the sandbox
+reaches only the relay, and setup cannot reopen egress. Custom allow/block lists are
+refused. When guests reach the relay at a different origin than `UCLOUD_RELAY_URL` (the
+gateway's private address), set `guest_relay_url` on the runtime or the interception;
+the runtime rewrites model and tool URLs to it. Relay-only sandboxes cannot install
+anything, so uv scripts come from `uv_toolkit` or `offline_python_bundle` (a pinned
+portable Python whose manifest lists the script digests it serves), and harness assets
+from `offline_harness_bundle` (Node, OpenCode, Pi, ...; unpacked after creation). Host
+MCP and tool servers reach sandboxes through the relay too (`UCloudTunnel`, the
+interception's host tunnel).
+
+**Failures.** A gateway `node_lost` raises `SandboxNodeLost` (a `SandboxError`) from any
+sandbox operation, so a trainer can retry the episode on a fresh sandbox. Managed jobs are
+never restarted: a briefly missing route is polled again for 120 s and transient log reads
+retry at the same offset; truncated output is an error. A lost response acknowledgement is
+re-sent with the same bytes rather than regenerated. A rollout's relay worker failure fails
+that rollout's current sandbox operation as a `TunnelError`. File transfers retry the
+node's admission refusals (CPU or memory pressure). `repair_loopback_hosts = true` adds
+`localhost` to /etc/hosts for images that ship an empty one.
+
 `toolkits = ["vf-harness:latest"]` asks the gateway to stack read-only toolkits (at most
 4) on each rollout's image under `/opt/ucloud/toolkits/<name>`. `uv_toolkit` names one
 of them whose uv, managed Python and prebuilt script environments verifiers uses to
