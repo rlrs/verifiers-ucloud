@@ -90,10 +90,19 @@ class _Process:
 class _Job:
     def __init__(self, argv, kwargs) -> None:
         self.argv, self.kwargs, self.signals = argv, kwargs, []
+        self.sandbox_id, self.job_id, self.refreshes = "sandbox-1", "job-1", 0
+        self.record = SimpleNamespace(terminal=False)
 
-    async def wait(self, **kwargs):
-        self.wait_kwargs = kwargs
-        return SimpleNamespace(state="exited", exit_code=3)
+    async def refresh(self):
+        self.refreshes += 1
+        self.record = SimpleNamespace(
+            state="exited",
+            exit_code=3,
+            terminal=True,
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
+        return self.record
 
     async def logs(self, stream: str, *, offset: int = 0):
         data = {"stdout": b"agent out", "stderr": b"agent err"}[stream]
@@ -289,7 +298,7 @@ async def test_runtime_lifecycle_uses_gateway_sdk(monkeypatch) -> None:
     assert job.argv == ["harness", "--go"]
     env = {"RUNTIME": "yes", "MAIN": "yes"}
     assert job.kwargs == {"env": env, "working_dir": "/app"}
-    assert job.wait_kwargs == {"poll_seconds": 2.0}
+    assert job.refreshes == 1 and job.signals == []  # ended: never signalled
     assert len(client.execs) == 1
 
     process = await runtime.open_process(["agent"], {"PROCESS": "yes"})
@@ -534,7 +543,8 @@ async def test_resource_phase_hints_are_optional_fenced_and_non_authoritative(
             with pytest.raises(asyncio.CancelledError):
                 await exercise()
         elif outcome == "failure":
-            with pytest.raises(ExceptionGroup):
+            # The rollout's own error, not wrapped in an ExceptionGroup.
+            with pytest.raises(RuntimeError, match="tool failed"):
                 await exercise()
         else:
             await exercise()
@@ -747,3 +757,301 @@ async def test_a_failed_loopback_repair_deletes_the_sandbox(monkeypatch) -> None
         await runtime.start()
     client = FailedHostsClient.instances[-1]
     assert client.deleted == ["failed-hosts"] and client.closed
+
+
+@pytest.mark.asyncio
+async def test_a_failed_relay_worker_fails_its_rollouts_operation(
+    monkeypatch, caplog
+) -> None:
+    from verifiers.v1.errors import TunnelError
+
+    import verifiers_ucloud.interception as module
+    from verifiers_ucloud.supervision import with_relay
+
+    async def fail(self, **kwargs):
+        await asyncio.sleep(0.01)
+        raise RuntimeError("relay failure sentinel")
+
+    monkeypatch.setattr(module, "InterceptionServer", _InterceptionServer)
+    monkeypatch.setattr(module, "AsyncRelayWorkerClient", _RelayClient)
+    monkeypatch.setattr(_RelaySession, "run", fail)
+    interception = UCloudInterception(
+        UCloudInterceptionConfig(relay_url="https://relay.example")
+    )
+    await interception.start()
+    session = cast(
+        RolloutSession, SimpleNamespace(trace=SimpleNamespace(id="failure-test"))
+    )
+    try:
+        with pytest.raises(TunnelError, match="relay failure sentinel"):
+            async with interception.acquire(session):
+                await with_relay(asyncio.sleep(1))
+        assert "UCloud relay worker failed: rollout=failure-test" in caplog.text
+    finally:
+        await interception.stop()
+
+
+@pytest.mark.asyncio
+async def test_relay_failure_stays_with_its_rollout_and_cancel_propagates() -> None:
+    from verifiers.v1.errors import TunnelError
+
+    from verifiers_ucloud.supervision import relay_worker, with_relay
+
+    async def fail():
+        await asyncio.sleep(0)
+        raise RuntimeError("worker failed")
+
+    async def affected():
+        worker = asyncio.create_task(fail())
+        token = relay_worker.set(worker)
+        try:
+            with pytest.raises(TunnelError, match="worker failed"):
+                await with_relay(asyncio.sleep(10))
+        finally:
+            relay_worker.reset(token)
+
+    sibling = asyncio.create_task(asyncio.sleep(0.05, result="completed"))
+    await affected()
+    assert await sibling == "completed"
+    worker = asyncio.create_task(asyncio.sleep(10))
+    token = relay_worker.set(worker)
+    operation = asyncio.create_task(with_relay(asyncio.sleep(10)))
+    try:
+        await asyncio.sleep(0)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert not worker.done()
+    finally:
+        relay_worker.reset(token)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+def test_relay_commit_retries_only_transport_with_identical_payload(
+    monkeypatch,
+) -> None:
+    from ucloud_sandboxes_sdk import AsyncRelayWorkerClient
+    from ucloud_sandboxes_sdk.relay import RelayApiError
+
+    from verifiers_ucloud.recovery import ResilientRelayWorkerClient
+
+    calls = []
+
+    async def request(self, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if len(calls) == 1:
+            raise RelayApiError("ack lost") from TimeoutError()
+        return {"ok": True}
+
+    async def no_sleep(_):
+        pass
+
+    monkeypatch.setattr(AsyncRelayWorkerClient, "_request_json", request)
+    monkeypatch.setattr("verifiers_ucloud.recovery.asyncio.sleep", no_sleep)
+    client = ResilientRelayWorkerClient("http://localhost", timeout_seconds=30)
+    body = {"request_id": "same-request", "body": "same-result"}
+    result = asyncio.run(client._request_json("POST", "/worker/respond", payload=body))
+    assert result == {"ok": True}
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert calls[0][2]["timeout_seconds"] == 120
+    calls.clear()
+    with pytest.raises(RelayApiError):
+        asyncio.run(client._request_json("POST", "/worker/register", payload=body))
+    assert len(calls) == 1
+
+
+def test_a_briefly_missing_job_route_is_polled_again_not_restarted() -> None:
+    from ucloud_sandboxes_sdk import SandboxApiError
+
+    from verifiers_ucloud.recovery import wait_for_managed_job
+
+    calls = []
+
+    async def refresh():
+        calls.append(1)
+        if len(calls) == 1:
+            raise SandboxApiError("sandbox route not found", status_code=404)
+        return SimpleNamespace(terminal=True)
+
+    job = SimpleNamespace(refresh=refresh, sandbox_id="sandbox", job_id="job")
+    assert asyncio.run(wait_for_managed_job(job, poll_seconds=0)).terminal
+    assert len(calls) == 2
+
+
+def test_node_loss_is_terminal_for_jobs_and_relay_commits(monkeypatch) -> None:
+    from ucloud_sandboxes_sdk import AsyncRelayWorkerClient, SandboxApiError
+    from ucloud_sandboxes_sdk.relay import RelayApiError
+
+    from verifiers_ucloud.recovery import (
+        ResilientRelayWorkerClient,
+        SandboxNodeLost,
+        wait_for_managed_job,
+    )
+
+    calls = []
+
+    async def refresh():
+        calls.append("refresh")
+        raise SandboxApiError(
+            "sandbox route not found", status_code=404, body={"error_code": "node_lost"}
+        )
+
+    async def request(*args, **kwargs):
+        calls.append("relay")
+        raise RelayApiError(
+            "wake failed",
+            status_code=503,
+            body={"error_code": "node_lost", "retryable": True},
+        )
+
+    monkeypatch.setattr(AsyncRelayWorkerClient, "_request_json", request)
+    job = SimpleNamespace(refresh=refresh, sandbox_id="sandbox", job_id="job")
+    with pytest.raises(SandboxNodeLost, match="node_lost"):
+        asyncio.run(wait_for_managed_job(job, poll_seconds=0))
+    client = ResilientRelayWorkerClient("http://localhost")
+    with pytest.raises(SandboxNodeLost, match="node_lost"):
+        asyncio.run(client._request_json("POST", "/worker/respond"))
+    assert calls == ["refresh", "relay"]
+    assert issubclass(SandboxNodeLost, SandboxError)
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_managed_log_reads_retry_at_the_same_offset(monkeypatch, stream) -> None:
+    from ucloud_sandboxes_sdk import SandboxApiError
+
+    from verifiers_ucloud.recovery import read_managed_logs
+
+    calls, sleeps = [], []
+    chunk = SimpleNamespace(data=b"next bytes", next_offset=133)
+
+    async def logs(stream, *, offset):
+        calls.append((stream, offset))
+        if len(calls) < 3:
+            raise SandboxApiError(
+                "retry read",
+                status_code=503,
+                body={
+                    "error_code": "managed_process_read_unavailable",
+                    "retryable": True,
+                },
+            )
+        return chunk
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr("verifiers_ucloud.recovery.asyncio.sleep", sleep)
+    job = SimpleNamespace(logs=logs, sandbox_id="sandbox", job_id="job")
+    assert asyncio.run(read_managed_logs(job, stream, offset=123)) is chunk
+    assert calls == [(stream, 123)] * 3
+    assert sleeps == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "kind,expected_calls",
+    [
+        ("exhausted", 5),
+        ("nonretryable", 1),
+        ("unrelated", 1),
+        ("node_lost", 1),
+        ("cancelled", 1),
+        ("missing_workdir", 1),
+    ],
+)
+def test_managed_log_read_failure_boundaries(monkeypatch, kind, expected_calls) -> None:
+    from ucloud_sandboxes_sdk import SandboxApiError
+
+    from verifiers_ucloud.recovery import SandboxNodeLost, read_managed_logs
+
+    body = {"error_code": "managed_process_read_unavailable", "retryable": True}
+    if kind == "nonretryable":
+        body["retryable"] = False
+    elif kind in ("unrelated", "node_lost"):
+        body["error_code"] = kind
+    if kind == "missing_workdir":
+        body["error"] = "failed to find initial working directory: no such file"
+    error = (
+        asyncio.CancelledError()
+        if kind == "cancelled"
+        else SandboxApiError("failed", status_code=503, body=body)
+    )
+    calls = []
+
+    async def logs(stream, *, offset):
+        calls.append((stream, offset))
+        raise error
+
+    async def sleep(delay):
+        pass
+
+    monkeypatch.setattr("verifiers_ucloud.recovery.asyncio.sleep", sleep)
+    job = SimpleNamespace(logs=logs, sandbox_id="sandbox", job_id="job")
+    expected = SandboxNodeLost if kind == "node_lost" else type(error)
+    with pytest.raises(expected):
+        asyncio.run(read_managed_logs(job, "stdout", offset=42))
+    assert calls == [("stdout", 42)] * expected_calls
+
+
+@pytest.mark.asyncio
+async def test_a_lost_node_ends_the_agent_without_signalling_it(monkeypatch) -> None:
+    from ucloud_sandboxes_sdk import SandboxApiError
+
+    import verifiers_ucloud.runtime as runtime_module
+    from verifiers_ucloud.recovery import SandboxNodeLost
+
+    class LostJob(_Job):
+        record = SimpleNamespace(terminal=False)
+
+        async def refresh(self):
+            raise SandboxApiError(
+                "gone", status_code=410, body={"error_code": "node_lost"}
+            )
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    runtime = UCloudRuntime(UCloudRuntimeConfig(group_create=False), name="lost")
+    await runtime.start()
+    try:
+
+        async def start_agent(argv, **kwargs):
+            runtime.sandbox.jobs.append(LostJob(argv, kwargs))
+            return runtime.sandbox.jobs[-1]
+
+        runtime.sandbox.start_agent = start_agent
+        with pytest.raises(SandboxNodeLost):
+            await runtime.run_program(["harness"], {})
+        assert runtime.sandbox.jobs[-1].signals == []
+    finally:
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_truncated_agent_output_is_an_error(monkeypatch) -> None:
+    import verifiers_ucloud.runtime as runtime_module
+
+    class TruncatedJob(_Job):
+        record = SimpleNamespace(terminal=True)
+
+        async def refresh(self):
+            return SimpleNamespace(
+                terminal=True,
+                exit_code=0,
+                stdout_truncated=True,
+                stderr_truncated=False,
+            )
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    runtime = UCloudRuntime(UCloudRuntimeConfig(group_create=False), name="truncated")
+    await runtime.start()
+    try:
+
+        async def start_agent(argv, **kwargs):
+            return TruncatedJob(argv, kwargs)
+
+        runtime.sandbox.start_agent = start_agent
+        with pytest.raises(SandboxError, match="log limit"):
+            await runtime.run_program(["harness"], {})
+    finally:
+        await runtime.stop()

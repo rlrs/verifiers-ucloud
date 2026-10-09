@@ -13,14 +13,16 @@ from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import PositiveInt
-from ucloud_sandboxes_sdk import AsyncRelayWorkerClient, AsyncSandboxHandle
+from ucloud_sandboxes_sdk import AsyncSandboxHandle
 from verifiers.v1.interception.base import BaseInterceptionConfig, Interception, Slot
 from verifiers.v1.interception.server import InterceptionServer
 from verifiers.v1.runtimes.base import Runtime
 from verifiers.v1.session import RolloutSession
 
 from ._resources import ensure_file_descriptor_capacity
+from .recovery import ResilientRelayWorkerClient as AsyncRelayWorkerClient
 from .runtime import UCloudRuntime
+from .supervision import relay_worker
 
 logger = logging.getLogger(__name__)
 
@@ -144,26 +146,39 @@ class UCloudInterception(Interception):
                     self._phase_sessions[rollout_id] = _PhaseSession(
                         registration_token
                     )
-                async with asyncio.TaskGroup() as workers:
-                    worker = workers.create_task(
-                        tunnel.run(
+
+                async def run_worker() -> None:
+                    try:
+                        await tunnel.run(
                             upstream_base_url=self.server.base_url,
                             cancel=cancel,
                             max_concurrency=8,
                             poll_timeout_seconds=self.config.poll_timeout_seconds,
                             lease_seconds=self.config.lease_seconds,
-                        ),
-                        name=f"ucloud-relay-{rollout_id}",
-                    )
+                        )
+                    except Exception:
+                        # Logged here; the rollout's next sandbox operation fails
+                        # with it (supervision.with_relay), not its siblings.
+                        logger.exception(
+                            "UCloud relay worker failed: rollout=%s", rollout_id
+                        )
+                        raise
+
+                worker = asyncio.create_task(
+                    run_worker(), name=f"ucloud-relay-{rollout_id}"
+                )
+                token = relay_worker.set(worker)
+                try:
                     await asyncio.sleep(0)
-                    try:
-                        await self.report_resource_phase(rollout_id, "tool")
-                        # verifiers appends paths (`{base_url}/v1`): the SDK's tunnel
-                        # URL ends in "/", and the relay refuses a "//" endpoint.
-                        yield tunnel.base_url.rstrip("/"), model_secret, state_secret
-                    finally:
-                        cancel.set()
-                        worker.cancel()
+                    await self.report_resource_phase(rollout_id, "tool")
+                    # verifiers appends paths (`{base_url}/v1`): the SDK's tunnel
+                    # URL ends in "/", and the relay refuses a "//" endpoint.
+                    yield tunnel.base_url.rstrip("/"), model_secret, state_secret
+                finally:
+                    relay_worker.reset(token)
+                    cancel.set()
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
                 await self.report_resource_phase(rollout_id, "rollout_complete")
         finally:
             self._phase_sessions.pop(rollout_id, None)

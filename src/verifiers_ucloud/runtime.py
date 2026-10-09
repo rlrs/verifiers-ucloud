@@ -26,7 +26,7 @@ from ucloud_sandboxes_sdk import (
     SandboxSpec,
 )
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
-from verifiers.v1.errors import SandboxError
+from verifiers.v1.errors import SandboxError, TunnelError
 from verifiers.v1.runtimes.base import (
     BaseRuntimeInfo,
     ProgramResult,
@@ -38,6 +38,13 @@ from verifiers.v1.runtimes.limiters import creation_limiter
 
 from ._groups import GroupPolicy, group_creates
 from ._resources import ensure_file_descriptor_capacity
+from .recovery import (
+    SandboxNodeLost,
+    node_lost,
+    read_managed_logs,
+    wait_for_managed_job,
+)
+from .supervision import with_relay
 
 logger = logging.getLogger(__name__)
 
@@ -196,10 +203,12 @@ async def _job_output(job: AsyncJobHandle) -> tuple[str, str]:
     for stream in ("stdout", "stderr"):
         data, offset = bytearray(), 0
         while True:
-            chunk = await job.logs(stream, offset=offset)
+            chunk = await with_relay(read_managed_logs(job, stream, offset=offset))
             data += chunk.data
-            if chunk.eof or chunk.next_offset <= offset:
+            if chunk.eof:
                 break
+            if chunk.next_offset <= offset:
+                raise SandboxError("Managed job log cursor did not advance")
             offset = chunk.next_offset
         streams.append(data.decode(errors="replace"))
     return streams[0], streams[1]
@@ -302,6 +311,8 @@ class UCloudRuntime(Runtime):
                         await client.delete_sandbox(self.info.id)
                 with contextlib.suppress(Exception):
                     await client.close()
+            if (lost := node_lost(exc)) is not None:
+                raise lost from exc
             raise SandboxError(f"ucloud sandbox provisioning failed: {exc}") from exc
 
     def _spec(self) -> SandboxSpec:
@@ -406,21 +417,34 @@ class UCloudRuntime(Runtime):
             return await self.run(argv, env)
         if self.sandbox is None:
             raise SandboxError("ucloud sandbox has no id")
+        job = None
         try:
+            # Started exactly once: recovery only ever polls the same job.
             job = await self.sandbox.start_agent(
                 argv, env=self.process_env(env), working_dir=self.config.workdir
             )
-            try:
-                record = await job.wait(poll_seconds=self.config.agent_poll_seconds)
-            except asyncio.CancelledError:
-                with contextlib.suppress(Exception):
-                    await asyncio.shield(job.signal(9))
-                raise
+            record = await with_relay(
+                wait_for_managed_job(job, poll_seconds=self.config.agent_poll_seconds)
+            )
             stdout, stderr = await _job_output(job)
+            if record.stdout_truncated or record.stderr_truncated:
+                raise SandboxError("Managed agent output exceeded its log limit")
         except asyncio.CancelledError:
             raise
+        except (TunnelError, SandboxNodeLost) as exc:
+            if isinstance(exc, SandboxNodeLost):
+                job = None  # A lost node cannot receive a signal.
+            raise
+        except SandboxError:
+            raise
         except Exception as exc:
+            if (lost := node_lost(exc)) is not None:
+                raise lost from exc
             raise SandboxError(f"ucloud agent failed: {exc}") from exc
+        finally:
+            if job is not None and not getattr(job.record, "terminal", False):
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(job.signal(9))
         return ProgramResult(
             exit_code=record.exit_code if record.exit_code is not None else 1,
             stdout=stdout,
@@ -441,12 +465,16 @@ class UCloudRuntime(Runtime):
         if self.info.id is None:
             raise SandboxError("ucloud sandbox has no id")
         try:
-            result = await self._client_or_raise().exec(
-                self.info.id,
-                argv,
-                env=self.process_env(env),
-                working_dir=self.config.workdir,
+            result = await with_relay(
+                self._client_or_raise().exec(
+                    self.info.id,
+                    argv,
+                    env=self.process_env(env),
+                    working_dir=self.config.workdir,
+                )
             )
+        except (TunnelError, SandboxNodeLost):
+            raise
         except Exception as exc:
             raise SandboxError(f"ucloud exec failed: {exc}") from exc
         return ProgramResult(
@@ -468,6 +496,8 @@ class UCloudRuntime(Runtime):
                 working_dir=self.config.workdir,
             )
         except Exception as exc:
+            if (lost := node_lost(exc)) is not None:
+                raise lost from exc
             raise SandboxError(f"ucloud live process failed to start: {exc}") from exc
         return UCloudProcess(process)
 
@@ -499,6 +529,8 @@ class UCloudRuntime(Runtime):
                 )
             )
         except Exception as exc:
+            if (lost := node_lost(exc)) is not None:
+                raise lost from exc
             raise SandboxError(f"read {path!r}: {exc}") from exc
 
     async def write(self, path: str, data: bytes) -> None:
@@ -512,6 +544,8 @@ class UCloudRuntime(Runtime):
                 )
             )
         except Exception as exc:
+            if (lost := node_lost(exc)) is not None:
+                raise lost from exc
             raise SandboxError(f"write {path!r}: {exc}") from exc
 
     async def write_many(self, files: Mapping[str, bytes]) -> None:
@@ -532,6 +566,8 @@ class UCloudRuntime(Runtime):
                 )
             )
         except Exception as exc:
+            if (lost := node_lost(exc)) is not None:
+                raise lost from exc
             raise SandboxError(f"write {len(batch)} files: {exc}") from exc
 
     def cleanup(self) -> None:
