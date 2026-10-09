@@ -1055,3 +1055,57 @@ async def test_truncated_agent_output_is_an_error(monkeypatch) -> None:
             await runtime.run_program(["harness"], {})
     finally:
         await runtime.stop()
+
+
+def test_parking_interactive_processes_needs_a_managed_sandbox() -> None:
+    with pytest.raises(ValueError, match="park_interactive"):
+        UCloudRuntimeConfig(park_interactive=True, managed_agent=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "uv_toolkit,interpreter",
+    [
+        (None, "/opt/verifiers-offline/abc/python/bin/python3.12"),
+        ("vf-harness", "/opt/ucloud/toolkits/vf-harness/uv-cache/env/bin/python"),
+    ],
+)
+async def test_interactive_processes_park_as_managed_jobs(
+    monkeypatch, uv_toolkit, interpreter
+) -> None:
+    import verifiers_ucloud.runtime as runtime_module
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    toolkits = ["vf-harness:v1"] if uv_toolkit else []
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(
+            group_create=False,
+            park_interactive=True,
+            toolkits=toolkits,
+            uv_toolkit=uv_toolkit,
+        ),
+        name="acp",
+    )
+    await runtime.start()
+    client = _SandboxClient.instances[-1]
+    try:
+        process = await runtime.open_process([interpreter, "/tmp/acp.py"], {"A": "1"})
+        job = runtime.sandbox.jobs[-1]
+        assert job.argv[0] == interpreter and job.argv[1] == "-I"
+        bridge, mailbox = job.argv[2], job.argv[3]
+        assert bridge == f"{mailbox}/bridge.py"
+        assert job.argv[4:] == [interpreter, "/tmp/acp.py"]
+        assert job.kwargs["env"] == {"A": "1"}
+        assert client.processes == []  # no live exec holds the sandbox
+        await process.write(b"request")
+        assert client.uploads[-1][1:] == (f"{mailbox}/0.tmp", b"request")
+        mv = client.execs[-1][1]
+        assert mv == ["mv", "--", f"{mailbox}/0.tmp", f"{mailbox}/0.ready"]
+
+        other = "/opt/ucloud/toolkits/other/bin/python"
+        for foreign in (other, "/usr/bin/python3"):
+            with pytest.raises(SandboxError, match="staged portable Python"):
+                await runtime.open_process([foreign, "/tmp/acp.py"], {})
+    finally:
+        await runtime.stop()

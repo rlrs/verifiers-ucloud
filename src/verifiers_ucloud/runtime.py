@@ -124,6 +124,10 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     program as one exec."""
     agent_poll_seconds: float = Field(2.0, gt=0)
     """How often a waiting `run_program` asks whether its managed program ended."""
+    park_interactive: bool = False
+    """Run live processes (`open_process`, e.g. an ACP agent) as managed jobs too,
+    so the sandbox can park while they wait for the model. Their interpreter must
+    be a staged offline Python or the `uv_toolkit`'s. Needs `managed_agent`."""
     repair_loopback_hosts: bool = False
     """After creation, add `localhost` and the sandbox's hostname to /etc/hosts when
     the image does not resolve them (some extracted images ship an empty file)."""
@@ -150,6 +154,12 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
                 )
         if self.guest_relay_url is not None:
             _relay_origin(self.guest_relay_url)
+        return self
+
+    @model_validator(mode="after")
+    def _park_interactive_needs_a_managed_sandbox(self) -> UCloudRuntimeConfig:
+        if self.park_interactive and not self.managed_agent:
+            raise ValueError("park_interactive needs managed_agent")
         return self
 
     @model_validator(mode="after")
@@ -486,6 +496,10 @@ class UCloudRuntime(Runtime):
     async def open_process(
         self, argv: list[str], env: dict[str, str]
     ) -> RuntimeProcess:
+        if self.config.park_interactive:
+            from .managed_process import ManagedProcess
+
+            return await ManagedProcess.start(self, argv, env)
         if self.info.id is None:
             raise SandboxError("ucloud sandbox has no id")
         try:
