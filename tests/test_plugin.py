@@ -663,3 +663,87 @@ async def test_relay_only_execution_admits_only_relay_routes(monkeypatch) -> Non
         await runtime.prepare_execution(None)
     # An open sandbox has nothing to enforce.
     await UCloudRuntime(UCloudRuntimeConfig(), name="b").prepare_execution(None)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["CPU load", "CPU pressure", "memory pressure"],
+)
+def test_file_transfers_retry_node_admission_refusals(monkeypatch, reason) -> None:
+    from ucloud_sandboxes_sdk import SandboxApiError
+
+    from verifiers_ucloud.runtime import _retry_admission
+
+    calls = []
+
+    async def operation():
+        calls.append(1)
+        if len(calls) == 1:
+            raise SandboxApiError(
+                f"direct node {reason} blocks active admission", status_code=503
+            )
+        return "ok"
+
+    async def no_sleep(delay):
+        pass
+
+    monkeypatch.setattr("verifiers_ucloud.runtime.asyncio.sleep", no_sleep)
+    assert asyncio.run(_retry_admission(operation)) == "ok"
+    assert len(calls) == 2
+
+
+def test_other_transfer_failures_are_not_retried(monkeypatch) -> None:
+    from ucloud_sandboxes_sdk import SandboxApiError
+
+    from verifiers_ucloud.runtime import _retry_admission
+
+    calls = []
+
+    async def operation():
+        calls.append(1)
+        raise SandboxApiError("sandbox route not found", status_code=503)
+
+    with pytest.raises(SandboxApiError):
+        asyncio.run(_retry_admission(operation))
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_loopback_hosts_are_repaired_only_when_asked(monkeypatch) -> None:
+    import verifiers_ucloud.runtime as runtime_module
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    plain = UCloudRuntime(UCloudRuntimeConfig(group_create=False), name="plain")
+    await plain.start()
+    assert _SandboxClient.instances[-1].execs == []
+    await plain.stop()
+
+    repaired = UCloudRuntime(
+        UCloudRuntimeConfig(group_create=False, repair_loopback_hosts=True),
+        name="repaired",
+    )
+    await repaired.start()
+    (_, command, _) = _SandboxClient.instances[-1].execs[-1]
+    assert command[:2] == ["sh", "-c"] and "getent hosts localhost" in command[2]
+    await repaired.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_loopback_repair_deletes_the_sandbox(monkeypatch) -> None:
+    import verifiers_ucloud.runtime as runtime_module
+
+    class FailedHostsClient(_SandboxClient):
+        async def exec(self, sandbox_id, command, **kwargs):
+            return _Result(exit_code=1, stdout="", stderr="read-only hosts file")
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", FailedHostsClient)
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(group_create=False, repair_loopback_hosts=True),
+        name="failed-hosts",
+    )
+    with pytest.raises(SandboxError, match="loopback hosts setup failed"):
+        await runtime.start()
+    client = FailedHostsClient.instances[-1]
+    assert client.deleted == ["failed-hosts"] and client.closed

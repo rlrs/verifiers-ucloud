@@ -19,6 +19,7 @@ from ucloud_sandboxes_sdk import (
     AsyncSandboxHandle,
     AsyncSandboxProcess,
     Image,
+    SandboxApiError,
     SandboxClient,
     SandboxNetworkPolicy,
     SandboxSecuritySpec,
@@ -41,6 +42,36 @@ from ._resources import ensure_file_descriptor_capacity
 logger = logging.getLogger(__name__)
 
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
+_ADMISSION_REJECTIONS = (
+    "direct node CPU load blocks active admission",
+    "direct node CPU pressure blocks active admission",
+    "direct node memory pressure blocks active admission",
+)
+_LOOPBACK_HOSTS = (
+    "if ! getent hosts localhost >/dev/null 2>&1; then "
+    "printf '\\n127.0.0.1 localhost\\n::1 localhost ip6-localhost ip6-loopback\\n' "
+    ">> /etc/hosts; fi; "
+    "sandbox_hostname=$(cat /proc/sys/kernel/hostname); "
+    'if ! getent hosts "$sandbox_hostname" >/dev/null 2>&1; then '
+    'printf "\\n127.0.0.1 %s\\n" "$sandbox_hostname" >> /etc/hosts; fi'
+)
+
+
+async def _retry_admission(operation):
+    """Retry an idempotent file transfer the node's resource admission refused."""
+    for attempt in range(8):
+        try:
+            return await operation()
+        except SandboxApiError as exc:
+            refused = any(reason in str(exc) for reason in _ADMISSION_REJECTIONS)
+            if exc.status_code != 503 or not refused or attempt == 7:
+                raise
+            delay = min(2**attempt, 8)
+            logger.warning(
+                "Sandbox file transfer refused by node admission; retrying in %ss",
+                delay,
+            )
+            await asyncio.sleep(delay)
 _DEFAULT_CREATE_TIMEOUT_SECONDS = 900.0
 
 
@@ -86,6 +117,9 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     program as one exec."""
     agent_poll_seconds: float = Field(2.0, gt=0)
     """How often a waiting `run_program` asks whether its managed program ended."""
+    repair_loopback_hosts: bool = False
+    """After creation, add `localhost` and the sandbox's hostname to /etc/hosts when
+    the image does not resolve them (some extracted images ship an empty file)."""
     toolkits: list[str] = Field(default_factory=list, max_length=4)
     """Read-only toolkits stacked on the image (``name:tag``): their files are under
     ``/opt/ucloud/toolkits/<name>``."""
@@ -256,9 +290,16 @@ class UCloudRuntime(Runtime):
                     record={"spec": spec.to_dict(), "generation": generation},
                 )
             self.info.id = self.sandbox.id
+            if self.config.repair_loopback_hosts:
+                hosts = await self.run(["sh", "-c", _LOOPBACK_HOSTS], {})
+                if hosts.exit_code:
+                    raise SandboxError(f"loopback hosts setup failed: {hosts.stderr}")
         except Exception as exc:
             client, self._client = self._client, None
             if client is not None:
+                if self.info.id is not None:
+                    with contextlib.suppress(Exception):
+                        await client.delete_sandbox(self.info.id)
                 with contextlib.suppress(Exception):
                     await client.close()
             raise SandboxError(f"ucloud sandbox provisioning failed: {exc}") from exc
@@ -452,8 +493,10 @@ class UCloudRuntime(Runtime):
         if self.info.id is None:
             raise SandboxError("ucloud sandbox has no id")
         try:
-            return await self._client_or_raise().download_file(
-                self.info.id, self._absolute(path)
+            return await _retry_admission(
+                lambda: self._client_or_raise().download_file(
+                    self.info.id, self._absolute(path)
+                )
             )
         except Exception as exc:
             raise SandboxError(f"read {path!r}: {exc}") from exc
@@ -463,8 +506,10 @@ class UCloudRuntime(Runtime):
             raise SandboxError("ucloud sandbox has no id")
         # The upload creates missing parent directories: one request per file.
         try:
-            await self._client_or_raise().upload_file(
-                self.info.id, self._absolute(path), data
+            await _retry_admission(
+                lambda: self._client_or_raise().upload_file(
+                    self.info.id, self._absolute(path), data
+                )
             )
         except Exception as exc:
             raise SandboxError(f"write {path!r}: {exc}") from exc
@@ -481,8 +526,10 @@ class UCloudRuntime(Runtime):
             raise SandboxError("ucloud sandbox has no id")
         # One archive request; the SDK's default mode is the one `write` produces.
         try:
-            await self._client_or_raise().upload_files(
-                self.info.id, dict(batch.values()), base_dir="/"
+            await _retry_admission(
+                lambda: self._client_or_raise().upload_files(
+                    self.info.id, dict(batch.values()), base_dir="/"
+                )
             )
         except Exception as exc:
             raise SandboxError(f"write {len(batch)} files: {exc}") from exc
