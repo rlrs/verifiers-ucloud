@@ -1236,3 +1236,34 @@ async def test_harness_bundles_unpack_only_known_paths(monkeypatch, tmp_path) ->
         assert "tar --no-same-owner -xzf" in client.execs[-1][1][3]
     finally:
         await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_host_tool_servers_reach_sandboxes_through_the_relay(
+    monkeypatch,
+) -> None:
+    from verifiers.v1.interception.tunnel import using_host_tunnel
+
+    import verifiers_ucloud.tunnel as tunnel_module
+    from verifiers_ucloud.tunnel import UCloudTunnel
+
+    monkeypatch.setattr(tunnel_module, "ResilientRelayWorkerClient", _RelayClient)
+    config = UCloudInterceptionConfig(
+        relay_url="https://relay.example", guest_relay_url="http://10.0.0.2:8092"
+    )
+    tunnel = config.host_tunnel()
+    assert isinstance(tunnel, UCloudTunnel)
+    async with tunnel.expose(7001) as url:
+        session = _RelayClient.instances[-1].sessions[-1]
+        assert url == f"https://relay.example/managed/{session.rollout_id}"
+        assert session.kwargs["metadata"] == {"consumer": "verifiers-shared-tools"}
+        await asyncio.sleep(0)
+        assert session.run_kwargs["upstream_base_url"] == "http://127.0.0.1:7001"
+    # A relay-only guest dials the tool server's relay URL at the guest origin.
+    runtime = UCloudRuntime(UCloudRuntimeConfig(allow=[]), name="tools")
+    with using_host_tunnel(tunnel):
+        guest = runtime.host_url(f"{url}/mcp")
+    assert guest == f"http://10.0.0.2:8092/managed/{session.rollout_id}/mcp"
+
+    with pytest.raises(ValueError, match="HTTP"):
+        UCloudInterceptionConfig(guest_relay_url="relay:8092")

@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import PositiveInt
+from pydantic import PositiveInt, field_validator
 from ucloud_sandboxes_sdk import AsyncSandboxHandle
 from verifiers.v1.interception.base import BaseInterceptionConfig, Interception, Slot
 from verifiers.v1.interception.server import InterceptionServer
@@ -21,7 +21,7 @@ from verifiers.v1.session import RolloutSession
 
 from ._resources import ensure_file_descriptor_capacity
 from .recovery import ResilientRelayWorkerClient as AsyncRelayWorkerClient
-from .runtime import UCloudRuntime
+from .runtime import UCloudRuntime, _relay_origin
 from .supervision import relay_worker
 
 logger = logging.getLogger(__name__)
@@ -38,11 +38,27 @@ class UCloudInterceptionConfig(BaseInterceptionConfig):
 
     type: Literal["ucloud"] = "ucloud"
     relay_url: str | None = None
+    guest_relay_url: str | None = None
+    """The relay origin as relay-only sandboxes reach it, when that differs from the
+    public relay URL; UCloudRuntime.host_url rewrites guests' relay URLs to it."""
     poll_timeout_seconds: float = 10.0
     lease_seconds: float = 900.0
     forward_timeout_seconds: float = 300.0
     max_inflight_requests: PositiveInt = 512
     resource_phase_hints: bool = False
+
+    @field_validator("guest_relay_url")
+    @classmethod
+    def _guest_relay_url_is_an_origin(cls, value: str | None) -> str | None:
+        if value is not None:
+            _relay_origin(value)
+        return value
+
+    def host_tunnel(self):
+        """Host tool servers reach UCloud sandboxes through the same relay."""
+        from .tunnel import UCloudTunnel
+
+        return UCloudTunnel(self)
 
 
 class UCloudInterception(Interception):
