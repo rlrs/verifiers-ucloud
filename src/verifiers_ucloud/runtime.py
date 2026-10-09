@@ -80,6 +80,8 @@ async def _retry_admission(operation):
                 delay,
             )
             await asyncio.sleep(delay)
+
+
 _DEFAULT_CREATE_TIMEOUT_SECONDS = 900.0
 
 
@@ -270,6 +272,7 @@ class UCloudRuntime(Runtime):
         """The started sandbox; interception binds the rollout's relay session to it."""
         self._offline_setup_lock = asyncio.Lock()
         self._offline_prefix: str | None = None
+        self._primary_claimed = False
         if config.uv_toolkit is not None:
             root = f"/opt/ucloud/toolkits/{config.uv_toolkit}"
             self.uv_env = {
@@ -278,6 +281,26 @@ class UCloudRuntime(Runtime):
                 "UV_PYTHON_INSTALL_DIR": f"{root}/python",
                 "UV_PYTHON_PREFERENCE": "only-managed",
             }
+
+    def _claim_primary(self, purpose: str) -> bool:
+        """Whether a program may run as the sandbox's managed primary process.
+
+        The gateway allows one primary per sandbox generation, even after it
+        exits, so only the first program claims it; later ones (an ACP process
+        restarted after a failed turn, a second program) run as execs, which keep
+        the sandbox resident while they wait.
+        """
+        if not self.config.managed_agent:
+            return False
+        if self._primary_claimed:
+            logger.warning(
+                "ucloud sandbox %s already ran its managed primary; %s runs as an exec",
+                self.info.id,
+                purpose,
+            )
+            return False
+        self._primary_claimed = True
+        return True
 
     def _client_or_raise(self) -> AsyncSandboxClient:
         if self._client is None:
@@ -380,24 +403,33 @@ class UCloudRuntime(Runtime):
             ),
         )
 
+    def _relay_urls(self) -> tuple[str, str | None]:
+        """The public relay URL host services publish, and the origin a relay-only
+        guest dials instead (None: the public one). Each comes from this runtime's
+        config, else the interception's host tunnel, else `UCLOUD_RELAY_URL`."""
+        from verifiers.v1.interception.tunnel import configured_host_tunnel
+
+        transport = getattr(configured_host_tunnel(), "config", None)
+        public = getattr(transport, "relay_url", None) or os.environ.get(
+            "UCLOUD_RELAY_URL", ""
+        )
+        guest = self.config.guest_relay_url or getattr(
+            transport, "guest_relay_url", None
+        )
+        return public, guest
+
     def host_url(self, url: str) -> str:
         """A relay-only guest reaches the public relay at `guest_relay_url`.
 
         Host services publish the external relay URL; keep its whole capability
         path and query, and change only the origin the guest dials.
         """
-        from verifiers.v1.interception.tunnel import configured_host_tunnel
-
-        transport = getattr(configured_host_tunnel(), "config", None)
-        guest_url = self.config.guest_relay_url or getattr(
-            transport, "guest_relay_url", None
-        )
-        if not (self.network_restricted and guest_url):
+        if not self.network_restricted:
             return super().host_url(url)
-        public = urlsplit(
-            getattr(transport, "relay_url", None)
-            or os.environ.get("UCLOUD_RELAY_URL", "")
-        )
+        public_url, guest_url = self._relay_urls()
+        if not guest_url:
+            return super().host_url(url)
+        public = urlsplit(public_url)
         parsed = urlsplit(url)
         if not public.netloc or (parsed.scheme, parsed.netloc) != (
             public.scheme,
@@ -433,9 +465,10 @@ class UCloudRuntime(Runtime):
                 "Relay-only UCloud networking is immutable; setup must use baked or "
                 "staged dependencies"
             )
-        relay = self.config.guest_relay_url or os.environ.get("UCLOUD_RELAY_URL", "")
+        # The origin host_url hands guests: the guest relay's, else the public one's.
+        public, guest = self._relay_urls()
         try:
-            allowed = _relay_origin(relay)
+            allowed = _relay_origin(_origin_of(guest or public))
             if any(_relay_origin(_origin_of(route)) != allowed for route in routes):
                 raise ValueError
         except ValueError:
@@ -443,13 +476,11 @@ class UCloudRuntime(Runtime):
                 "Framework route is outside the configured UCloud relay origin"
             ) from None
 
-    async def run_program(
-        self, argv: list[str], env: dict[str, str]
-    ) -> ProgramResult:
-        if not self.config.managed_agent:
-            return await self.run(argv, env)
+    async def run_program(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         if self.sandbox is None:
             raise SandboxError("ucloud sandbox has no id")
+        if not self._claim_primary("this program"):
+            return await self.run(argv, env)
         job = None
         try:
             # Started exactly once: recovery only ever polls the same job.
@@ -476,8 +507,10 @@ class UCloudRuntime(Runtime):
             raise SandboxError(f"ucloud agent failed: {exc}") from exc
         finally:
             if job is not None and not getattr(job.record, "terminal", False):
+                # The supervisor refuses SIGKILL: SIGTERM goes to the program's
+                # process group, and teardown's delete ends whatever ignores it.
                 with contextlib.suppress(Exception):
-                    await asyncio.shield(job.signal(9))
+                    await asyncio.shield(job.signal(15))
         return ProgramResult(
             exit_code=record.exit_code if record.exit_code is not None else 1,
             stdout=stdout,
@@ -520,9 +553,17 @@ class UCloudRuntime(Runtime):
         self, argv: list[str], env: dict[str, str]
     ) -> RuntimeProcess:
         if self.config.park_interactive:
-            from .managed_process import ManagedProcess
+            from .managed_process import ManagedProcess, prepared_interpreter
 
-            return await ManagedProcess.start(self, argv, env)
+            # The bridge runs with the program's interpreter (argv[0]): ACP
+            # prepares its script with activate=False, so argv starts with it.
+            if not argv or not prepared_interpreter(self, argv[0]):
+                raise SandboxError(
+                    "Managed interactive processes need an interpreter this runtime "
+                    "prepared (staged portable Python)"
+                )
+            if self._claim_primary("this process"):
+                return await ManagedProcess.start(self, argv, env)
         if self.info.id is None:
             raise SandboxError("ucloud sandbox has no id")
         try:

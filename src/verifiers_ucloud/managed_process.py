@@ -13,10 +13,10 @@ import asyncio
 import uuid
 
 from ucloud_sandboxes_sdk import SandboxApiError
-from verifiers.v1.errors import SandboxError
+from verifiers.v1.errors import SandboxError, TunnelError
 from verifiers.v1.runtimes.base import RuntimeProcess
 
-from .recovery import read_managed_logs, wait_for_managed_job
+from .recovery import node_lost, read_managed_logs, wait_for_managed_job
 from .supervision import with_relay
 
 OFFLINE_PREFIX = "/opt/verifiers-offline/"
@@ -26,13 +26,20 @@ OFFLINE_PREFIX = "/opt/verifiers-offline/"
 BRIDGE = r"""
 import os, pathlib, signal, subprocess, sys, threading, time
 mailbox = pathlib.Path(sys.argv[1])
-child = subprocess.Popen(sys.argv[2:], stdin=subprocess.PIPE, start_new_session=True)
+child, pending = None, []
 def stop(sig, frame):
+    if child is None:
+        pending.append(sig)
+        return
     try: os.killpg(child.pid, sig)
     except ProcessLookupError: pass
+# Installed before the child starts: a signal in between is forwarded once it runs.
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGUSR1, lambda sig, frame: stop(signal.SIGKILL, frame))
+child = subprocess.Popen(sys.argv[2:], stdin=subprocess.PIPE, start_new_session=True)
+for sig in pending:
+    stop(sig, None)
 def feed():
     index = 0
     while child.poll() is None:
@@ -48,10 +55,26 @@ def feed():
             return
         index += 1
 threading.Thread(target=feed, daemon=True).start()
-sys.exit(child.wait())
+code = child.wait()
+sys.exit(128 - code if code < 0 else code)  # A signalled child exits 128+N.
 """
 
 _TRANSITIONS = {"parked", "parking", "unparking", "resuming", "waking", "suspending"}
+
+
+async def _job_call(operation, what: str):
+    """Await a gateway call for the managed process as a verifiers SandboxError
+    (SandboxNodeLost for a lost node)."""
+    try:
+        return await with_relay(operation)
+    except (SandboxError, TunnelError):
+        raise
+    except Exception as error:
+        if (lost := node_lost(error)) is not None:
+            raise lost from error
+        raise SandboxError(
+            f"Managed interactive process {what} failed: {error}"
+        ) from error
 
 
 def prepared_interpreter(runtime, interpreter: str) -> bool:
@@ -70,6 +93,7 @@ class ManagedProcess(RuntimeProcess):
     def __init__(self, runtime, job, mailbox: str) -> None:
         self.runtime, self.job, self.mailbox = runtime, job, mailbox
         self._index = 0
+        self._input_failed: BaseException | None = None
         self._write_lock = asyncio.Lock()
         self.stdout = self._logs("stdout")
         self.stderr = self._logs("stderr")
@@ -79,35 +103,32 @@ class ManagedProcess(RuntimeProcess):
         sandbox = runtime.sandbox
         if sandbox is None:
             raise SandboxError("Managed process requires a started managed sandbox")
-        # The bridge runs with the program's interpreter (argv[0]): ACP prepares
-        # its script with activate=False, so argv starts with that Python.
-        if not argv or not prepared_interpreter(runtime, argv[0]):
-            raise SandboxError(
-                "Managed interactive processes need an interpreter this runtime "
-                "prepared (staged portable Python)"
-            )
         mailbox = f"/tmp/vf-managed-{uuid.uuid4().hex}"
         result = await runtime.run(["mkdir", "-m", "700", mailbox], {})
         if result.exit_code:
             raise SandboxError("Could not create managed process mailbox")
         bridge = f"{mailbox}/bridge.py"
         await runtime.write(bridge, BRIDGE.encode())
-        job = await with_relay(
+        job = await _job_call(
             sandbox.start_agent(
                 [argv[0], "-I", bridge, mailbox, *argv],
                 env=runtime.process_env(env),
                 working_dir=runtime.config.workdir,
                 max_stdout_bytes=128 * 1024 * 1024,
                 max_stderr_bytes=8 * 1024 * 1024,
-            )
+            ),
+            "start",
         )
         return cls(runtime, job, mailbox)
 
     async def _logs(self, stream: str):
         client = self.runtime._client_or_raise()
         offset = 0
+        ended = False  # The job ended: read its log to the end, then stop.
         while True:
-            state = await with_relay(client.get_sandbox_status(self.job.sandbox_id))
+            state = await _job_call(
+                client.get_sandbox_status(self.job.sandbox_id), "status"
+            )
             if state is None:
                 raise SandboxError("Managed process sandbox no longer exists")
             if state.get("state") in _TRANSITIONS:
@@ -122,7 +143,9 @@ class ManagedProcess(RuntimeProcess):
                 if error.status_code == 400 and in_transition:
                     await asyncio.sleep(2)
                     continue
-                raise
+                raise SandboxError(
+                    f"Managed interactive process {stream} read failed: {error}"
+                ) from error
             stalled = chunk.data and chunk.next_offset <= offset
             if chunk.next_offset < offset or stalled:
                 raise SandboxError("Managed process log cursor did not advance")
@@ -130,32 +153,48 @@ class ManagedProcess(RuntimeProcess):
             if chunk.data:
                 yield chunk.data
             if chunk.eof:
-                record = await with_relay(self.job.refresh())
+                if ended:
+                    return
+                record = await _job_call(self.job.refresh(), "status")
                 if record.stdout_truncated or record.stderr_truncated:
                     raise SandboxError("Managed interactive process output truncated")
                 if record.terminal:
-                    return
+                    # `eof` is the log's end as of that read: what the process wrote
+                    # before it exited (ACP's last reply) may have landed since.
+                    ended = True
+                    continue
             if not chunk.data:
                 await asyncio.sleep(2)
 
     async def write(self, data: bytes) -> None:
         async with self._write_lock:
+            if self._input_failed is not None:
+                raise SandboxError(
+                    "Managed process input stopped after a failed write"
+                ) from self._input_failed
             path = f"{self.mailbox}/{self._index}"
-            await self.runtime.write(path + ".tmp", data)
-            result = await self.runtime.run(
-                ["mv", "--", path + ".tmp", path + ".ready"], {}
-            )
-            if result.exit_code:
-                raise SandboxError("Could not publish managed process input")
+            try:
+                await self.runtime.write(path + ".tmp", data)
+                result = await self.runtime.run(
+                    ["mv", "--", path + ".tmp", path + ".ready"], {}
+                )
+                if result.exit_code:
+                    raise SandboxError("Could not publish managed process input")
+            except BaseException as error:
+                # Whether this input reached the bridge is unknown, and the bridge
+                # reads inputs strictly in order: publishing another could reuse
+                # this index or leave a gap it waits on forever.
+                self._input_failed = error
+                raise
             self._index += 1
 
     async def wait(self) -> int:
-        record = await with_relay(wait_for_managed_job(self.job, poll_seconds=1))
+        record = await _job_call(wait_for_managed_job(self.job, poll_seconds=1), "wait")
         return record.exit_code if record.exit_code is not None else 1
 
     async def terminate(self) -> None:
-        await self.job.signal(15)
+        await _job_call(self.job.signal(15), "terminate")
 
     async def kill(self) -> None:
         # The bridge turns SIGUSR1 into SIGKILL for the child's process group.
-        await self.job.signal(10)
+        await _job_call(self.job.signal(10), "kill")

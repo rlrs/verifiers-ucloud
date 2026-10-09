@@ -23,12 +23,16 @@ class SandboxNodeLost(SandboxError):
     """
 
 
+# `exec_worker_lost`: the node running an exec was lost, so its sandbox is too.
+_NODE_LOST = re.compile(r"\b(?:node_lost|exec_worker_lost)\b")
+
+
 def is_node_lost(error: BaseException) -> bool:
     def marked(value: object) -> bool:
         if isinstance(value, dict):
             keys = ("error_code", "code", "reason", "error", "status", "state")
             return any(marked(value.get(key)) for key in keys)
-        return isinstance(value, str) and re.search(r"\bnode_lost\b", value) is not None
+        return isinstance(value, str) and _NODE_LOST.search(value) is not None
 
     return marked(getattr(error, "body", None)) or marked(str(error))
 
@@ -89,11 +93,18 @@ class ResilientRelayWorkerClient(AsyncRelayWorkerClient):
         raise AssertionError("unreachable")
 
 
+def _retryable(error: SandboxApiError) -> bool:
+    """The gateway marks answers worth repeating, such as a node whose heartbeat
+    is briefly stale (503 `sandbox_worker_unreachable`)."""
+    body = error.body
+    return isinstance(body, dict) and body.get("retryable") is True
+
+
 async def wait_for_managed_job(job, *, recovery_seconds=120.0, poll_seconds=2.0):
     """Poll a managed job until it ends, never re-launching it.
 
-    A route briefly missing (a park/wake moving the sandbox) is polled again for
-    at most `recovery_seconds`; a lost node is terminal.
+    Answers the gateway marks retryable (beyond the SDK's own few retries) are
+    polled again for at most `recovery_seconds`; a lost node is terminal.
     """
     failed_since = None
     while True:
@@ -102,17 +113,16 @@ async def wait_for_managed_job(job, *, recovery_seconds=120.0, poll_seconds=2.0)
         except SandboxApiError as error:
             if (lost := node_lost(error)) is not None:
                 raise lost from error
-            missing = "sandbox route not found" in str(error)
-            route_missing = error.status_code == 404 and missing
-            if not route_missing:
+            if not _retryable(error):
                 raise
             now = time.monotonic()
             if failed_since is None:
                 failed_since = now
                 logger.warning(
-                    "Managed job route missing; polling %s/%s for at most %.0fs",
+                    "Managed job %s/%s unavailable (%s); polling for at most %.0fs",
                     job.sandbox_id,
                     job.job_id,
+                    error,
                     recovery_seconds,
                 )
             if now - failed_since >= recovery_seconds:

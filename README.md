@@ -80,7 +80,10 @@ the sandbox writes. Needs a verifiers that passes the runtime to
 OpenCode or Pi) runs as a managed job behind a small bridge, with stdin through a mailbox
 directory and stdout/stderr from the job's logs, so the sandbox parks while the agent
 waits for the model instead of holding a live exec. The process's interpreter must be an
-interpreter this runtime prepared with `prepare_uv_script`, as ACP's is.
+interpreter this runtime prepared with `prepare_uv_script`, as ACP's is. The gateway allows
+one managed primary process per sandbox, even after it exits: the first `run_program` or
+`open_process` gets it, and later ones (an ACP process restarted after a failed turn) run
+as live execs, which keep the sandbox resident.
 
 `image_reference_type = "name"` sends `image` as a gateway image name instead of a
 registry reference: name an image recipe registered with the SDK's
@@ -98,14 +101,19 @@ from `offline_harness_bundle` (Node, OpenCode, Pi, ...; unpacked after creation)
 MCP and tool servers reach sandboxes through the relay too (`UCloudTunnel`, the
 interception's host tunnel).
 
-**Failures.** A gateway `node_lost` raises `SandboxNodeLost` (a `SandboxError`) from any
-sandbox operation, so a trainer can retry the episode on a fresh sandbox. Managed jobs are
-never restarted: a briefly missing route is polled again for 120 s and transient log reads
-retry at the same offset; truncated output is an error. A lost response acknowledgement is
-re-sent with the same bytes rather than regenerated. A rollout's relay worker failure fails
-that rollout's current sandbox operation as a `TunnelError`. File transfers retry the
-node's admission refusals (CPU or memory pressure). `repair_loopback_hosts = true` adds
-`localhost` to /etc/hosts for images that ship an empty one.
+**Failures.** A lost node (the gateway's `node_lost`, or `exec_worker_lost` for an exec)
+raises `SandboxNodeLost` (a `SandboxError`) from creation, execs, file transfers and
+managed processes, so a trainer can retry the episode on a fresh sandbox; teardown only
+logs it. Managed jobs are never restarted: answers the gateway marks retryable (a node's
+briefly stale heartbeat) are polled again for 120 s and transient log reads retry at the
+same offset; truncated output is an error. A cancelled program gets SIGTERM (the gateway
+refuses SIGKILL for managed jobs) and the sandbox's deletion ends whatever ignores it. A
+lost response acknowledgement is re-sent with the same bytes rather than regenerated. A
+rollout's relay worker failure fails that rollout's current sandbox operation as a
+`TunnelError`; a host tool relay that fails is restarted on the same session, so it fails
+only the tool calls in flight. File transfers retry the node's admission refusals (CPU or
+memory pressure). `repair_loopback_hosts = true` adds `localhost` to /etc/hosts for images
+that ship an empty one.
 
 `toolkits = ["vf-harness:latest"]` asks the gateway to stack read-only toolkits (at most
 4) on each rollout's image under `/opt/ucloud/toolkits/<name>`. `uv_toolkit` names one

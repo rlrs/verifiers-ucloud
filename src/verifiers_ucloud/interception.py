@@ -159,9 +159,7 @@ class UCloudInterception(Interception):
                     registration_token = tunnel.registration_token
                     if registration_token is None:
                         raise RuntimeError("relay session has no active registration")
-                    self._phase_sessions[rollout_id] = _PhaseSession(
-                        registration_token
-                    )
+                    self._phase_sessions[rollout_id] = _PhaseSession(registration_token)
 
                 async def run_worker() -> None:
                     try:
@@ -191,10 +189,10 @@ class UCloudInterception(Interception):
                     # URL ends in "/", and the relay refuses a "//" endpoint.
                     yield tunnel.base_url.rstrip("/"), model_secret, state_secret
                 finally:
-                    relay_worker.reset(token)
                     cancel.set()
                     worker.cancel()
                     await asyncio.gather(worker, return_exceptions=True)
+                    relay_worker.reset(token)
                 await self.report_resource_phase(rollout_id, "rollout_complete")
         finally:
             self._phase_sessions.pop(rollout_id, None)

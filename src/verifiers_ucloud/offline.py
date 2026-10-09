@@ -9,6 +9,7 @@ manifests' SHA-256 before use; a bundle's manifest is `<archive>.json`.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -17,6 +18,7 @@ import tarfile
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
+from ucloud_sandboxes_sdk.client import MAX_FILE_BODY_BYTES
 from verifiers.v1.errors import SandboxError
 
 PYTHON_ROOT = "/opt/verifiers-offline"
@@ -35,11 +37,21 @@ def _manifest(archive: Path) -> dict:
     return json.loads(archive.with_name(archive.name + ".json").read_text())
 
 
+def _read_archive(archive: Path) -> bytes:
+    # Each sandbox gets the archive in one upload, which the gateway caps.
+    if archive.stat().st_size > MAX_FILE_BODY_BYTES:
+        raise SandboxError(
+            f"Offline bundle {archive} exceeds the {MAX_FILE_BODY_BYTES} byte "
+            "upload limit"
+        )
+    return archive.read_bytes()
+
+
 @lru_cache(maxsize=2)
 def read_bundle(path: str) -> tuple[bytes, dict]:
     archive = Path(path)
     manifest = _manifest(archive)
-    data = archive.read_bytes()
+    data = _read_archive(archive)
     if hashlib.sha256(data).hexdigest() != manifest["sha256"]:
         raise SandboxError("Offline Python bundle checksum mismatch")
     if manifest["python"] != "python/bin/python3.12":
@@ -54,7 +66,7 @@ async def prepare_script(runtime, script, env=None, *, activate=True) -> list[st
         raise SandboxError("Relay-only script setup requires an offline_python_bundle")
     data = script.encode() if isinstance(script, str) else script
     digest = hashlib.sha256(data).hexdigest()
-    archive, manifest = read_bundle(str(bundle))
+    archive, manifest = await asyncio.to_thread(read_bundle, str(bundle))
     if digest not in manifest["scripts"]:
         raise SandboxError("Script is absent from the offline Python bundle manifest")
     prefix = f"{PYTHON_ROOT}/{manifest['sha256']}"
@@ -101,7 +113,7 @@ async def prepare_script(runtime, script, env=None, *, activate=True) -> list[st
 def read_harness_bundle(path: str) -> tuple[bytes, dict]:
     archive = Path(path)
     manifest = _manifest(archive)
-    blob = archive.read_bytes()
+    blob = _read_archive(archive)
     if hashlib.sha256(blob).hexdigest() != manifest["sha256"]:
         raise SandboxError("Offline harness bundle checksum mismatch")
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
@@ -120,7 +132,9 @@ def read_harness_bundle(path: str) -> tuple[bytes, dict]:
 
 async def prepare_harness_bundle(runtime) -> None:
     """Unpack the harness bundle into the sandbox's root after its checksum."""
-    blob, manifest = read_harness_bundle(str(runtime.config.offline_harness_bundle))
+    blob, manifest = await asyncio.to_thread(
+        read_harness_bundle, str(runtime.config.offline_harness_bundle)
+    )
     path = f"/var/tmp/vf-harness-{manifest['sha256']}.tar.gz"
     await runtime.write(path, blob)
     sha, path_q = shlex.quote(manifest["sha256"]), shlex.quote(path)

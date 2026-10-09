@@ -861,7 +861,7 @@ def test_relay_commit_retries_only_transport_with_identical_payload(
     assert len(calls) == 1
 
 
-def test_a_briefly_missing_job_route_is_polled_again_not_restarted() -> None:
+def test_a_briefly_unreachable_worker_is_polled_again_not_restarted() -> None:
     from ucloud_sandboxes_sdk import SandboxApiError
 
     from verifiers_ucloud.recovery import wait_for_managed_job
@@ -871,12 +871,37 @@ def test_a_briefly_missing_job_route_is_polled_again_not_restarted() -> None:
     async def refresh():
         calls.append(1)
         if len(calls) == 1:
-            raise SandboxApiError("sandbox route not found", status_code=404)
+            raise SandboxApiError(
+                "sandbox worker heartbeat is stale or unavailable",
+                status_code=503,
+                body={"error_code": "sandbox_worker_unreachable", "retryable": True},
+            )
         return SimpleNamespace(terminal=True)
 
     job = SimpleNamespace(refresh=refresh, sandbox_id="sandbox", job_id="job")
     assert asyncio.run(wait_for_managed_job(job, poll_seconds=0)).terminal
     assert len(calls) == 2
+
+
+def test_a_deleted_sandbox_route_is_not_polled_again() -> None:
+    from ucloud_sandboxes_sdk import SandboxApiError
+
+    from verifiers_ucloud.recovery import wait_for_managed_job
+
+    calls = []
+
+    async def refresh():
+        calls.append(1)
+        raise SandboxApiError(
+            "sandbox route not found",
+            status_code=404,
+            body={"error": "sandbox route not found"},
+        )
+
+    job = SimpleNamespace(refresh=refresh, sandbox_id="sandbox", job_id="job")
+    with pytest.raises(SandboxApiError):
+        asyncio.run(wait_for_managed_job(job, poll_seconds=0))
+    assert len(calls) == 1
 
 
 def test_node_loss_is_terminal_for_jobs_and_relay_commits(monkeypatch) -> None:
@@ -1090,6 +1115,11 @@ async def test_interactive_processes_park_as_managed_jobs(
     await runtime.start()
     client = _SandboxClient.instances[-1]
     try:
+        # Refused before the sandbox's one managed primary is claimed.
+        other = "/opt/ucloud/toolkits/other/bin/python"
+        for foreign in (other, "/usr/bin/python3"):
+            with pytest.raises(SandboxError, match="staged portable Python"):
+                await runtime.open_process([foreign, "/tmp/acp.py"], {})
         process = await runtime.open_process([interpreter, "/tmp/acp.py"], {"A": "1"})
         job = runtime.sandbox.jobs[-1]
         assert job.argv[0] == interpreter and job.argv[1] == "-I"
@@ -1102,16 +1132,35 @@ async def test_interactive_processes_park_as_managed_jobs(
         assert client.uploads[-1][1:] == (f"{mailbox}/0.tmp", b"request")
         mv = client.execs[-1][1]
         assert mv == ["mv", "--", f"{mailbox}/0.tmp", f"{mailbox}/0.ready"]
+    finally:
+        await runtime.stop()
 
-        other = "/opt/ucloud/toolkits/other/bin/python"
-        for foreign in (other, "/usr/bin/python3"):
-            with pytest.raises(SandboxError, match="staged portable Python"):
-                await runtime.open_process([foreign, "/tmp/acp.py"], {})
+
+@pytest.mark.asyncio
+async def test_a_sandbox_runs_one_managed_primary_then_execs(monkeypatch) -> None:
+    import verifiers_ucloud.runtime as runtime_module
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(group_create=False, park_interactive=True), name="acp"
+    )
+    await runtime.start()
+    client = _SandboxClient.instances[-1]
+    try:
         # In an open sandbox, the uv environment this runtime prepared qualifies.
         prepared = "/root/.cache/uv/environments-v2/acp-0123/bin/python"
         runtime._uv_interpreters["acp-digest"] = prepared
         await runtime.open_process([prepared, "/tmp/acp.py"], {})
         assert runtime.sandbox.jobs[-1].argv[0] == prepared
+        # The gateway allows one primary per sandbox generation, even after it
+        # exits: a restarted ACP process and a later program run as execs.
+        await runtime.open_process([prepared, "/tmp/acp.py"], {})
+        assert len(runtime.sandbox.jobs) == 1
+        assert client.processes[-1][1] == [prepared, "/tmp/acp.py"]
+        result = await runtime.run_program(["harness"], {})
+        assert len(runtime.sandbox.jobs) == 1
+        assert client.execs[-1][1] == ["harness"] and result.exit_code == 0
     finally:
         await runtime.stop()
 
@@ -1272,3 +1321,217 @@ async def test_host_tool_servers_reach_sandboxes_through_the_relay(
 
     with pytest.raises(ValueError, match="HTTP"):
         UCloudInterceptionConfig(guest_relay_url="relay:8092")
+
+
+@pytest.mark.asyncio
+async def test_relay_only_execution_admits_the_origin_host_url_hands_guests(
+    monkeypatch,
+) -> None:
+    from verifiers.v1.interception.tunnel import using_host_tunnel
+
+    # The relay URLs come from the interception alone.
+    monkeypatch.delenv("UCLOUD_RELAY_URL", raising=False)
+    interception = UCloudInterceptionConfig(
+        relay_url="https://relay.example/base", guest_relay_url="http://10.0.0.2:8092"
+    )
+    runtime = UCloudRuntime(UCloudRuntimeConfig(allow=[]), name="a")
+    with using_host_tunnel(interception.host_tunnel):
+        endpoint = runtime.host_url("https://relay.example/base/managed/r1/v1")
+        assert endpoint == "http://10.0.0.2:8092/managed/r1/v1"
+        await runtime.prepare_execution([endpoint])
+        with pytest.raises(SandboxError, match="outside"):
+            await runtime.prepare_execution(["https://relay.example/base/v1"])
+    # Without a guest origin, a public relay URL's path prefix is not its origin.
+    monkeypatch.setenv("UCLOUD_RELAY_URL", "https://relay.example/base")
+    await runtime.prepare_execution(["https://relay.example/base/managed/r1/v1"])
+    monkeypatch.delenv("UCLOUD_RELAY_URL")
+    with pytest.raises(SandboxError, match="outside"):
+        await runtime.prepare_execution(["https://relay.example/managed/r1/v1"])
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_program_is_terminated_not_killed(monkeypatch) -> None:
+    import verifiers_ucloud.runtime as runtime_module
+
+    class RunningJob(_Job):
+        async def refresh(self):
+            return self.record  # never ends on its own
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(group_create=False, agent_poll_seconds=0.01), name="c"
+    )
+    await runtime.start()
+    try:
+        started = asyncio.Event()
+
+        async def start_agent(argv, **kwargs):
+            runtime.sandbox.jobs.append(RunningJob(argv, kwargs))
+            started.set()
+            return runtime.sandbox.jobs[-1]
+
+        runtime.sandbox.start_agent = start_agent
+        task = asyncio.create_task(runtime.run_program(["harness"], {}))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The managed-process supervisor refuses SIGKILL (and SIGSTOP).
+        assert runtime.sandbox.jobs[-1].signals == [15]
+    finally:
+        await runtime.stop()
+
+
+def _managed_process(job, **runtime_attrs):
+    from verifiers_ucloud.managed_process import ManagedProcess
+
+    async def status(sandbox_id):
+        return {"state": "running"}
+
+    client = SimpleNamespace(get_sandbox_status=status)
+    runtime = SimpleNamespace(_client_or_raise=lambda: client, **runtime_attrs)
+    return ManagedProcess(runtime, job, "/tmp/mailbox")
+
+
+@pytest.mark.asyncio
+async def test_interactive_output_is_read_to_its_end_after_the_process_exits() -> None:
+    reads = [b"first", b"", b"last reply"]
+    log = b"".join(reads)
+
+    class ExitingJob:
+        sandbox_id, job_id = "sandbox", "job"
+
+        def __init__(self) -> None:
+            self.reads, self.refreshes = 0, 0
+
+        async def logs(self, stream, *, offset=0):
+            end = len(b"".join(reads[: self.reads + 1]))
+            self.reads += 1
+            return SimpleNamespace(data=log[offset:end], next_offset=end, eof=True)
+
+        async def refresh(self):
+            # The process exits after its first output; its last reply lands in
+            # the log after the read that found the log's end.
+            self.refreshes += 1
+            return SimpleNamespace(
+                terminal=self.refreshes > 1,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+    process = _managed_process(ExitingJob())
+    assert b"".join([chunk async for chunk in process.stdout]) == b"firstlast reply"
+
+
+@pytest.mark.asyncio
+async def test_input_stops_after_a_write_whose_outcome_is_unknown() -> None:
+    uploads, runs = [], []
+
+    async def write(path, data):
+        uploads.append(path)
+
+    async def run(argv, env):
+        runs.append(argv)
+        raise TimeoutError("the mv's answer was lost")
+
+    process = _managed_process(SimpleNamespace(), write=write, run=run)
+    with pytest.raises(TimeoutError):
+        await process.write(b"one")
+    # The bridge may already have read input 0: never publish another.
+    with pytest.raises(SandboxError, match="failed write"):
+        await process.write(b"two")
+    assert uploads == ["/tmp/mailbox/0.tmp"] and len(runs) == 1
+
+
+def test_bridge_feeds_stdin_in_order_and_reports_signals(tmp_path) -> None:
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    from verifiers_ucloud.managed_process import BRIDGE
+
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text(BRIDGE)
+    (tmp_path / "1.ready").write_bytes(b"two\n")
+    (tmp_path / "0.ready").write_bytes(b"one\n")
+    child = "import sys; print(sys.stdin.readline() + sys.stdin.readline(), end='')"
+    done = subprocess.run(
+        [sys.executable, str(bridge), str(tmp_path), sys.executable, "-c", child],
+        capture_output=True,
+        timeout=30,
+    )
+    assert (done.returncode, done.stdout) == (0, b"one\ntwo\n")
+
+    sleeper = subprocess.Popen(
+        [sys.executable, str(bridge), str(tmp_path / "empty"), "sleep", "30"]
+    )
+    time.sleep(0.5)
+    sleeper.send_signal(signal.SIGTERM)
+    assert sleeper.wait(timeout=30) == 128 + signal.SIGTERM
+
+
+def test_exec_worker_loss_is_node_loss() -> None:
+    from ucloud_sandboxes_sdk import SandboxApiError
+
+    from verifiers_ucloud.recovery import SandboxNodeLost, node_lost
+
+    error = SandboxApiError(
+        "exec worker was lost; the accepted command cannot resume",
+        status_code=410,
+        body={"error_code": "exec_worker_lost", "retryable": False},
+    )
+    assert isinstance(node_lost(error), SandboxNodeLost)
+
+
+@pytest.mark.asyncio
+async def test_tool_relay_keeps_the_tunnel_contract(monkeypatch) -> None:
+    from verifiers.v1.errors import TunnelError
+
+    import verifiers_ucloud.tunnel as tunnel_module
+
+    monkeypatch.setattr(tunnel_module, "ResilientRelayWorkerClient", _RelayClient)
+    monkeypatch.setattr(tunnel_module, "_RESTART_SECONDS", (0,))
+    config = UCloudInterceptionConfig(relay_url="https://relay.example")
+    tunnel = config.host_tunnel()
+
+    # The caller's own error comes out unchanged, not in an ExceptionGroup.
+    with pytest.raises(KeyError):
+        async with tunnel.expose(7001):
+            raise KeyError("caller")
+
+    # A failed worker is restarted on the same session; the scope stays up.
+    runs, restarted = [], asyncio.Event()
+
+    async def flaky_run(self, **kwargs):
+        runs.append(1)
+        if len(runs) == 1:
+            raise RuntimeError("one request's commit was refused")
+        restarted.set()
+        await kwargs["cancel"].wait()
+
+    monkeypatch.setattr(_RelaySession, "run", flaky_run)
+    async with tunnel.expose(7001):
+        await asyncio.wait_for(restarted.wait(), 5)
+
+    # A setup failure is a TunnelError.
+    class Unreachable(_RelayClient):
+        async def __aenter__(self):
+            raise OSError("relay unreachable")
+
+    monkeypatch.setattr(tunnel_module, "ResilientRelayWorkerClient", Unreachable)
+    with pytest.raises(TunnelError, match="failed to start"):
+        async with tunnel.expose(7001):
+            pass
+
+
+def test_offline_bundles_over_the_upload_limit_are_refused(
+    monkeypatch, tmp_path
+) -> None:
+    import verifiers_ucloud.offline as offline_module
+
+    archive = _bundle(tmp_path, "big.tar.gz", {"var/tmp/vf-node/x": b"x" * 64})
+    monkeypatch.setattr(offline_module, "MAX_FILE_BODY_BYTES", 16)
+    with pytest.raises(SandboxError, match="upload limit"):
+        offline_module.read_harness_bundle(str(archive))
