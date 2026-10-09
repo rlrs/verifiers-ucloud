@@ -46,6 +46,10 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
 
     type: Literal["ucloud"] = "ucloud"
     image: str = "python:3.11-slim"
+    image_reference_type: Literal["registry", "name"] = "registry"
+    """How the gateway resolves `image`: a registry reference, or a name the gateway
+    knows, such as an image recipe registered with `register_image_recipes`. A
+    sandbox named after a recipe waits for its build."""
     workdir: str = "/app"
     network_access: bool = True
     cpu: float = 1.0
@@ -215,7 +219,11 @@ class UCloudRuntime(Runtime):
     def _spec(self) -> SandboxSpec:
         common = dict(
             id=self.name,
-            image=Image.from_registry(self.config.image),
+            image=(
+                Image.from_name(self.config.image)
+                if self.config.image_reference_type == "name"
+                else Image.from_registry(self.config.image)
+            ),
             env=self.env,
             working_dir=self.config.workdir,
             cpus=self.config.cpu,

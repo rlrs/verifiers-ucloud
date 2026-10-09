@@ -601,3 +601,14 @@ async def test_bounded_reads_use_the_verifiers_capped_read(monkeypatch) -> None:
         assert await runtime.read("log.txt") == b"sandbox-1:/app/log.txt"
     finally:
         await runtime.stop()
+
+
+def test_images_resolve_by_registry_reference_or_gateway_name() -> None:
+    by_registry = UCloudRuntime(UCloudRuntimeConfig(image="python:3.12"), name="a")
+    assert by_registry._spec().image.tag is not None
+    by_name = UCloudRuntime(
+        UCloudRuntimeConfig(image="tmax:task_000001", image_reference_type="name"),
+        name="b",
+    )
+    image = by_name._spec().image
+    assert image.name == "tmax:task_000001" and image.tag is None
