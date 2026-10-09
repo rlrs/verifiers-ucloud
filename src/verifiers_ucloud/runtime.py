@@ -9,6 +9,7 @@ import os
 import shlex
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
+from pathlib import Path
 from typing import ClassVar, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -124,6 +125,12 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     program as one exec."""
     agent_poll_seconds: float = Field(2.0, gt=0)
     """How often a waiting `run_program` asks whether its managed program ended."""
+    offline_python_bundle: Path | None = None
+    """A pinned portable Python bundle (with `<bundle>.json`) that runs harness uv
+    scripts in relay-only sandboxes without a `uv_toolkit`."""
+    offline_harness_bundle: Path | None = None
+    """A pinned archive of harness assets (Node, OpenCode, Pi, ...) unpacked into
+    each sandbox after creation."""
     park_interactive: bool = False
     """Run live processes (`open_process`, e.g. an ACP agent) as managed jobs too,
     so the sandbox can park while they wait for the model. Their interpreter must
@@ -260,6 +267,8 @@ class UCloudRuntime(Runtime):
         self._client: AsyncSandboxClient | None = None
         self.sandbox: AsyncSandboxHandle | None = None
         """The started sandbox; interception binds the rollout's relay session to it."""
+        self._offline_setup_lock = asyncio.Lock()
+        self._offline_prefix: str | None = None
         if config.uv_toolkit is not None:
             root = f"/opt/ucloud/toolkits/{config.uv_toolkit}"
             self.uv_env = {
@@ -313,6 +322,10 @@ class UCloudRuntime(Runtime):
                 hosts = await self.run(["sh", "-c", _LOOPBACK_HOSTS], {})
                 if hosts.exit_code:
                     raise SandboxError(f"loopback hosts setup failed: {hosts.stderr}")
+            if self.config.offline_harness_bundle is not None:
+                from .offline import prepare_harness_bundle
+
+                await prepare_harness_bundle(self)
         except Exception as exc:
             client, self._client = self._client, None
             if client is not None:
@@ -399,6 +412,15 @@ class UCloudRuntime(Runtime):
         return urlunsplit(
             (guest.scheme, guest.netloc, path, parsed.query, parsed.fragment)
         )
+
+    async def prepare_uv_script(self, script, env=None, *, activate=True):
+        # A relay-only sandbox cannot install uv or dependencies: a uv toolkit's
+        # prebuilt environments, or else the offline Python bundle, run scripts.
+        if not self.network_restricted or self.config.uv_toolkit is not None:
+            return await super().prepare_uv_script(script, env, activate=activate)
+        from .offline import prepare_script
+
+        return await prepare_script(self, script, env, activate=activate)
 
     async def prepare_execution(self, routes: list[str] | None) -> None:
         """The gateway enforces the relay policy from creation onward: it cannot be

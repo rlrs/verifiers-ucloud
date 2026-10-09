@@ -1109,3 +1109,130 @@ async def test_interactive_processes_park_as_managed_jobs(
                 await runtime.open_process([foreign, "/tmp/acp.py"], {})
     finally:
         await runtime.stop()
+
+
+def _bundle(tmp_path, name: str, members: dict[str, bytes], **manifest) -> object:
+    import hashlib
+    import io
+    import json
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for member, data in members.items():
+            info = tarfile.TarInfo(member)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    archive = tmp_path / name
+    archive.write_bytes(buffer.getvalue())
+    manifest.setdefault("sha256", hashlib.sha256(buffer.getvalue()).hexdigest())
+    (tmp_path / f"{name}.json").write_text(json.dumps(manifest))
+    return archive
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uv_toolkit", [None, "vf-harness"])
+async def test_relay_only_uv_scripts_use_the_toolkit_or_the_offline_bundle(
+    monkeypatch, uv_toolkit
+) -> None:
+    from verifiers.v1.runtimes.base import Runtime
+
+    import verifiers_ucloud.offline as offline_module
+
+    calls = []
+
+    async def framework(self, script, env=None, *, activate=True):
+        calls.append("toolkit")
+        return ["python", "script.py"]
+
+    async def offline(runtime, script, env=None, *, activate=True):
+        calls.append("offline")
+        return ["python", "script.py"]
+
+    monkeypatch.setattr(Runtime, "prepare_uv_script", framework)
+    monkeypatch.setattr(offline_module, "prepare_script", offline)
+    config = UCloudRuntimeConfig(
+        allow=[],
+        toolkits=["vf-harness:v1"] if uv_toolkit else [],
+        uv_toolkit=uv_toolkit,
+    )
+    await UCloudRuntime(config, name="relay-only").prepare_uv_script("print(1)")
+    assert calls == ["toolkit" if uv_toolkit else "offline"]
+
+
+@pytest.mark.asyncio
+async def test_offline_python_runs_only_the_scripts_it_was_built_for(
+    monkeypatch, tmp_path
+) -> None:
+    import hashlib
+
+    import verifiers_ucloud.offline as offline_module
+    import verifiers_ucloud.runtime as runtime_module
+
+    script = "print('harness')"
+    digest = hashlib.sha256(script.encode()).hexdigest()
+    bundle = _bundle(
+        tmp_path,
+        "python.tar.gz",
+        {"python/bin/python3.12": b"#!"},
+        python="python/bin/python3.12",
+        scripts=[digest],
+    )
+    offline_module.read_bundle.cache_clear()
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(allow=[], group_create=False, offline_python_bundle=bundle),
+        name="offline",
+    )
+    await runtime.start()
+    client = _SandboxClient.instances[-1]
+    try:
+        argv = await runtime.prepare_uv_script(script, activate=False)
+        sha = offline_module.read_bundle(str(bundle))[1]["sha256"]
+        interpreter = f"/opt/verifiers-offline/{sha}/python/bin/python3.12"
+        assert argv == [interpreter, "-I", f"{runtime.scripts_dir}/{digest}.py"]
+        setup = client.execs[-1][1][2]
+        assert "sha256sum -c" in setup and "tar --no-same-owner" in setup
+        await runtime.prepare_uv_script(script, activate=False)
+        assert len(client.execs) == 1  # the bundle is staged once per sandbox
+        with pytest.raises(SandboxError, match="absent"):
+            await runtime.prepare_uv_script("print('other')")
+    finally:
+        await runtime.stop()
+
+    (tmp_path / "python.tar.gz").write_bytes(b"tampered")
+    offline_module.read_bundle.cache_clear()
+    with pytest.raises(SandboxError, match="checksum"):
+        offline_module.read_bundle(str(bundle))
+
+
+@pytest.mark.asyncio
+async def test_harness_bundles_unpack_only_known_paths(monkeypatch, tmp_path) -> None:
+    import verifiers_ucloud.offline as offline_module
+    import verifiers_ucloud.runtime as runtime_module
+
+    good = _bundle(
+        tmp_path, "agents.tar.gz", {"var/tmp/vf-opencode/bin/opencode": b"#!"}
+    )
+    bad = _bundle(tmp_path, "bad.tar.gz", {"etc/passwd": b"x"})
+    unsafe = _bundle(tmp_path, "unsafe.tar.gz", {"var/tmp/vf-node/../../x": b"x"})
+    offline_module.read_harness_bundle.cache_clear()
+    with pytest.raises(SandboxError, match="Unexpected harness archive member"):
+        offline_module.read_harness_bundle(str(bad))
+    with pytest.raises(SandboxError, match="Unsafe"):
+        offline_module.read_harness_bundle(str(unsafe))
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(group_create=False, offline_harness_bundle=good),
+        name="agents",
+    )
+    await runtime.start()
+    client = _SandboxClient.instances[-1]
+    try:
+        assert client.uploads[-1][1].startswith("/var/tmp/vf-harness-")
+        assert "tar --no-same-owner -xzf" in client.execs[-1][1][3]
+    finally:
+        await runtime.stop()
