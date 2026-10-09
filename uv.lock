@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.12' and sys_platform == 'win32'",
@@ -13,9 +13,9 @@ resolution-markers = [
 [options]
 
 [options.exclude-newer-package]
-prime-tunnel = false
 prime-pydantic-config = false
 prime-sandboxes = false
+prime-tunnel = false
 renderers = false
 
 [[package]]
@@ -617,8 +617,8 @@ name = "httpcore2"
 version = "2.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "h11", marker = "sys_platform != 'emscripten'" },
-    { name = "truststore", marker = "sys_platform != 'emscripten'" },
+    { name = "h11" },
+    { name = "truststore" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/be/ad/f4f0e57345f1870f3e8cb624e058d7eca6e5a27d33bcc3311d9b618734cd/httpcore2-2.12.0.tar.gz", hash = "sha256:9293522bba0aa7c4c8e9e3f040c16575bd8868e155a77fa30c7a9085a5eae648", size = 67548, upload-time = "2026-08-18T13:22:08.211Z" }
 wheels = [
@@ -2476,8 +2476,8 @@ name = "uvicorn"
 version = "0.52.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", marker = "sys_platform != 'emscripten'" },
-    { name = "h11", marker = "sys_platform != 'emscripten'" },
+    { name = "click" },
+    { name = "h11" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/f2/0f/3f86e61397dd33bf2ccf28188c40db6a740658aeebbbf6e7dbc101a1f487/uvicorn-0.52.4.tar.gz", hash = "sha256:73acfee47a0b133c5de13d219492d62d8a31e935f4fe6e41a232451a15379f86", size = 100627, upload-time = "2026-08-19T06:27:41.821Z" }
 wheels = [
@@ -2512,7 +2512,8 @@ wheels = [
 
 [[package]]
 name = "verifiers"
-source = { editable = "../verifiers" }
+version = "0.2.1.post1"
+source = { git = "https://github.com/rlrs/verifiers?rev=v0.2.1.post1#e914dc95e681e60790c64f8c867f8805e51b0160" }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiolimiter" },
@@ -2543,87 +2544,9 @@ dependencies = [
     { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9.0" },
-    { name = "aiolimiter", specifier = ">=1.2.1" },
-    { name = "anthropic", specifier = ">=0.78.0" },
-    { name = "datasets", specifier = ">=3.3.0,<6.0.0" },
-    { name = "gepa", specifier = ">=0.0.6" },
-    { name = "harbor", marker = "python_full_version >= '3.12' and extra == 'harbor'", specifier = "==0.21.0" },
-    { name = "httpx", specifier = ">=0.27.0" },
-    { name = "loguru", specifier = ">=0.7.0" },
-    { name = "math-verify", specifier = ">=0.8.0" },
-    { name = "mcp", specifier = ">=1.24.0,<2" },
-    { name = "modal", marker = "extra == 'modal'", specifier = ">=1.4.0" },
-    { name = "msgpack", specifier = ">=1.1.2" },
-    { name = "nemo-gym", marker = "python_full_version >= '3.12' and extra == 'nemo-gym'", specifier = "==0.4.0" },
-    { name = "nest-asyncio", marker = "extra == 'notebook'", specifier = ">=1.6.0" },
-    { name = "nltk", marker = "extra == 'ta'", specifier = ">=3.9.2" },
-    { name = "numpy", specifier = ">=2.1.0" },
-    { name = "openai", specifier = ">=2.9.0" },
-    { name = "openai-agents", specifier = ">=0.8.2" },
-    { name = "openenv", marker = "extra == 'openenv'", specifier = ">=0.4.1" },
-    { name = "prime-pydantic-config", extras = ["toml"], specifier = ">=0.4.3" },
-    { name = "prime-sandboxes", specifier = ">=0.2.39" },
-    { name = "prime-tunnel", specifier = ">=0.1.8" },
-    { name = "pydantic", specifier = ">=2.12.3" },
-    { name = "python-dotenv", marker = "extra == 'browser'", specifier = ">=1.0.0" },
-    { name = "pyzmq", specifier = ">=27.1.0" },
-    { name = "reasoning-gym", marker = "extra == 'rg'", specifier = ">=0.1.8" },
-    { name = "renderers", specifier = ">=0.1.10" },
-    { name = "requests" },
-    { name = "rich", specifier = ">=11.0.0" },
-    { name = "setproctitle", specifier = ">=1.3.0" },
-    { name = "stagehand", marker = "extra == 'browser'", specifier = ">=3.4.0" },
-    { name = "tenacity", specifier = ">=8.5.0" },
-    { name = "textarena", marker = "extra == 'ta'", specifier = "==0.7.4" },
-    { name = "tomli-w", specifier = ">=1.0.0" },
-    { name = "typing-extensions", specifier = ">=4.12.2" },
-    { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'", specifier = ">=0.21.0" },
-]
-provides-extras = ["browser", "harbor", "modal", "nemo-gym", "notebook", "openenv", "rg", "ta"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "nest-asyncio", specifier = ">=1.6.0" },
-    { name = "nltk", specifier = ">=3.9.2" },
-    { name = "pre-commit", specifier = ">=2.19.0" },
-    { name = "pytest", specifier = ">=7.0.0,<9.1.0" },
-    { name = "pytest-asyncio", specifier = ">=0.21.0" },
-    { name = "pytest-cov", specifier = ">=4.0.0" },
-    { name = "pytest-xdist", specifier = ">=3.8.0" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
-    { name = "reasoning-gym", specifier = ">=0.1.8" },
-    { name = "ruff", specifier = ">=0.16.0" },
-    { name = "stagehand", specifier = ">=3.4.0" },
-    { name = "textarena", specifier = "==0.7.4" },
-    { name = "ty", specifier = ">=0.0.63" },
-]
-examples = [
-    { name = "alphabet-sort", editable = "../verifiers/environments/alphabet_sort" },
-    { name = "bash-interception", editable = "../verifiers/environments/bash_interception" },
-    { name = "code-golf", editable = "../verifiers/environments/code_golf" },
-    { name = "color-codeword", editable = "../verifiers/environments/color_codeword" },
-    { name = "compact", editable = "../verifiers/environments/compact" },
-    { name = "deepwiki", editable = "../verifiers/environments/deepwiki" },
-    { name = "glossary", editable = "../verifiers/environments/glossary" },
-    { name = "grayscale-interception", editable = "../verifiers/environments/grayscale_interception" },
-    { name = "gsm8k", editable = "../verifiers/environments/gsm8k" },
-    { name = "interception", editable = "../verifiers/environments/interception" },
-    { name = "kuhn-poker", editable = "../verifiers/environments/kuhn_poker" },
-    { name = "openenv-wordle", editable = "../verifiers/environments/openenv_wordle" },
-    { name = "proposer-solver", editable = "../verifiers/environments/proposer_solver" },
-    { name = "reverse-text", editable = "../verifiers/environments/reverse_text" },
-    { name = "scratchpad", editable = "../verifiers/environments/scratchpad" },
-    { name = "web-search-interception", editable = "../verifiers/environments/web_search_interception" },
-    { name = "wiki-search", editable = "../verifiers/environments/wiki_search" },
-    { name = "wordle", editable = "../verifiers/environments/wordle" },
-]
-
 [[package]]
 name = "verifiers-ucloud"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "ucloud-sandboxes-sdk", extra = ["async"] },
@@ -2641,7 +2564,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ucloud-sandboxes-sdk", extras = ["async"], url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.37/ucloud_sandboxes_sdk-0.4.37-py3-none-any.whl" },
-    { name = "verifiers", editable = "../verifiers" },
+    { name = "verifiers", git = "https://github.com/rlrs/verifiers?rev=v0.2.1.post1" },
 ]
 
 [package.metadata.requires-dev]

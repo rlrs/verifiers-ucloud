@@ -2,6 +2,25 @@
 
 UCloud sandbox runtime and relay-backed interception for verifiers v1.
 
+## Install (this is the one thing a client needs)
+
+```console
+uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.2.0"
+```
+
+That tag pins everything else:
+
+| Package | Version | From |
+|---|---|---|
+| `verifiers-ucloud` | 0.2.0 | this repository, tag `v0.2.0` |
+| `ucloud-sandboxes-sdk` | 0.4.37 | [release wheel](https://github.com/rlrs/ucloud-sandboxes-sdk/releases/tag/v0.4.37) |
+| `verifiers` | 0.2.1.post1: upstream `main` of 2026-08-29 plus the runtime-provider hooks | [`rlrs/verifiers` tag `v0.2.1.post1`](https://github.com/rlrs/verifiers/releases/tag/v0.2.1.post1) |
+
+Do not install `ucloud-sandboxes-sdk` or `verifiers` separately, and do not use
+other branches of these repositories: upgrade by moving to a newer
+`verifiers-ucloud` tag. The server (`rlrs/ucloud-sandboxes`) is operated for you;
+clients never install it.
+
 The package exports both integrations from `verifiers_ucloud`. Once installed,
 verifiers discovers them from the normal config types:
 
@@ -22,7 +41,7 @@ Set `UCLOUD_SANDBOX_URL` and, when required,
 `UCLOUD_SANDBOX_API_TOKEN` for the sandbox gateway. Set `UCLOUD_RELAY_URL` and,
 when required, `UCLOUD_RELAY_WORKER_TOKEN` for relay interception.
 
-For local development beside the `verifiers` repository:
+For development of this package:
 
 ```console
 uv sync
@@ -78,9 +97,8 @@ startup logs a warning; configure `LimitNOFILE=8192` for a systemd runner, or
 set the shell's `ulimit -n 8192` before launch. Smaller runs can still operate
 under a lower limit.
 
-The SDK installs from its versioned GitHub release wheel; no local SDK checkout
-is required. The development environment still uses the sibling Verifiers
-checkout configured in `tool.uv.sources`.
+The SDK installs from its versioned GitHub release wheel and verifiers from the
+tagged `rlrs/verifiers` fork; no sibling checkouts are required.
 
 `[env.interception].max_inflight_requests` defaults to 512 and is shared by all
 rollout sessions of this interception instance. Workers queue for capacity
