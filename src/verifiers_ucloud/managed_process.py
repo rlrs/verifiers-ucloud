@@ -54,13 +54,16 @@ sys.exit(child.wait())
 _TRANSITIONS = {"parked", "parking", "unparking", "resuming", "waking", "suspending"}
 
 
-def interpreter_prefixes(runtime) -> tuple[str, ...]:
-    """Interpreters a managed process may start with: a staged offline bundle's,
-    or the configured uv toolkit's."""
+def prepared_interpreter(runtime, interpreter: str) -> bool:
+    """Whether `interpreter` is one this runtime staged: a uv script environment it
+    prepared (in an open sandbox, a toolkit or the offline bundle), or anything
+    under the offline bundle or the configured uv toolkit."""
+    if interpreter in runtime._uv_interpreters.values():
+        return True
     prefixes = [OFFLINE_PREFIX]
     if runtime.config.uv_toolkit is not None:
         prefixes.append(f"/opt/ucloud/toolkits/{runtime.config.uv_toolkit}/")
-    return tuple(prefixes)
+    return interpreter.startswith(tuple(prefixes))
 
 
 class ManagedProcess(RuntimeProcess):
@@ -78,9 +81,10 @@ class ManagedProcess(RuntimeProcess):
             raise SandboxError("Managed process requires a started managed sandbox")
         # The bridge runs with the program's interpreter (argv[0]): ACP prepares
         # its script with activate=False, so argv starts with that Python.
-        if not argv or not argv[0].startswith(interpreter_prefixes(runtime)):
+        if not argv or not prepared_interpreter(runtime, argv[0]):
             raise SandboxError(
-                "Managed interactive processes require staged portable Python"
+                "Managed interactive processes need an interpreter this runtime "
+                "prepared (staged portable Python)"
             )
         mailbox = f"/tmp/vf-managed-{uuid.uuid4().hex}"
         result = await runtime.run(["mkdir", "-m", "700", mailbox], {})

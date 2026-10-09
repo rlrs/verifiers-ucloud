@@ -134,7 +134,8 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     park_interactive: bool = False
     """Run live processes (`open_process`, e.g. an ACP agent) as managed jobs too,
     so the sandbox can park while they wait for the model. Their interpreter must
-    be a staged offline Python or the `uv_toolkit`'s. Needs `managed_agent`."""
+    be one this runtime prepared with `prepare_uv_script`, as ACP's is. Needs
+    `managed_agent`."""
     repair_loopback_hosts: bool = False
     """After creation, add `localhost` and the sandbox's hostname to /etc/hosts when
     the image does not resolve them (some extracted images ship an empty file)."""

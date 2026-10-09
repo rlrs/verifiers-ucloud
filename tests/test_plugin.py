@@ -1107,6 +1107,11 @@ async def test_interactive_processes_park_as_managed_jobs(
         for foreign in (other, "/usr/bin/python3"):
             with pytest.raises(SandboxError, match="staged portable Python"):
                 await runtime.open_process([foreign, "/tmp/acp.py"], {})
+        # In an open sandbox, the uv environment this runtime prepared qualifies.
+        prepared = "/root/.cache/uv/environments-v2/acp-0123/bin/python"
+        runtime._uv_interpreters["acp-digest"] = prepared
+        await runtime.open_process([prepared, "/tmp/acp.py"], {})
+        assert runtime.sandbox.jobs[-1].argv[0] == prepared
     finally:
         await runtime.stop()
 

@@ -79,8 +79,8 @@ the sandbox writes. Needs a verifiers that passes the runtime to
 `park_interactive = true` parks live processes too: `open_process` (an ACP agent such as
 OpenCode or Pi) runs as a managed job behind a small bridge, with stdin through a mailbox
 directory and stdout/stderr from the job's logs, so the sandbox parks while the agent
-waits for the model instead of holding a live exec. The process's interpreter must be a
-staged offline Python or the `uv_toolkit`'s.
+waits for the model instead of holding a live exec. The process's interpreter must be an
+interpreter this runtime prepared with `prepare_uv_script`, as ACP's is.
 
 `image_reference_type = "name"` sends `image` as a gateway image name instead of a
 registry reference: name an image recipe registered with the SDK's
