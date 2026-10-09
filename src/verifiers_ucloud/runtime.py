@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import shlex
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from typing import ClassVar, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import Field, model_validator
 from ucloud_sandboxes_sdk import (
@@ -18,10 +20,11 @@ from ucloud_sandboxes_sdk import (
     AsyncSandboxProcess,
     Image,
     SandboxClient,
+    SandboxNetworkPolicy,
     SandboxSecuritySpec,
     SandboxSpec,
 )
-from verifiers.v1.configs.runtime import BaseRuntimeConfig
+from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.runtimes.base import (
     BaseRuntimeInfo,
@@ -41,7 +44,7 @@ _DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
 _DEFAULT_CREATE_TIMEOUT_SECONDS = 900.0
 
 
-class UCloudRuntimeConfig(BaseRuntimeConfig):
+class UCloudRuntimeConfig(NetworkPolicyConfig):
     """Configuration for one gateway-managed sandbox."""
 
     type: Literal["ucloud"] = "ucloud"
@@ -52,6 +55,11 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
     sandbox named after a recipe waits for its build."""
     workdir: str = "/app"
     network_access: bool = True
+    relay_name: str = Field(default="default", pattern=r"^[a-z][a-z0-9-]{0,31}$")
+    """The gateway relay a relay-only sandbox may reach (`allow = []`)."""
+    guest_relay_url: str | None = None
+    """The relay origin as a relay-only sandbox reaches it, when that differs from
+    `UCLOUD_RELAY_URL` (e.g. the gateway's private address)."""
     cpu: float = 1.0
     memory: float = 2.0
     gpu: str | None = None
@@ -87,6 +95,23 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
     image's own tools."""
 
     @model_validator(mode="after")
+    def _relay_only_policy(self) -> UCloudRuntimeConfig:
+        if self.network_restricted:
+            if self.allow:
+                raise ValueError(
+                    "UCloud supports framework-only relay access, not custom "
+                    "allow/block lists"
+                )
+            if not self.network_access:
+                raise ValueError(
+                    "Framework-only UCloud access requires bridge transport for "
+                    "the relay"
+                )
+        if self.guest_relay_url is not None:
+            _relay_origin(self.guest_relay_url)
+        return self
+
+    @model_validator(mode="after")
     def _uv_toolkit_is_requested(self) -> UCloudRuntimeConfig:
         names = [ref.split("@")[0].split(":")[0] for ref in self.toolkits]
         if self.uv_toolkit is not None and self.uv_toolkit not in names:
@@ -96,6 +121,28 @@ class UCloudRuntimeConfig(BaseRuntimeConfig):
 
 class UCloudRuntimeInfo(UCloudRuntimeConfig, BaseRuntimeInfo):
     pass
+
+
+def _relay_origin(url: str) -> tuple[str, str, int]:
+    """An HTTP(S) origin's scheme, host and port; anything else is refused."""
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError("guest_relay_url must be an HTTP(S) origin")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return parsed.scheme, parsed.hostname, port
+
+
+def _origin_of(url: str) -> str:
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
 def _same_file_key(path: str) -> str:
@@ -230,6 +277,11 @@ class UCloudRuntime(Runtime):
             memory_mb=round(self.config.memory * 1024),
             disk_mb=round(self.config.disk * 1024),
             network="bridge" if self.config.network_access else "none",
+            network_policy=(
+                SandboxNetworkPolicy.relay_only(self.config.relay_name)
+                if self.network_restricted
+                else SandboxNetworkPolicy()
+            ),
             ttl_seconds=self.config.ttl_seconds,
             labels=self.config.labels,
         )
@@ -251,6 +303,60 @@ class UCloudRuntime(Runtime):
                 user="0:0", cap_drop=(), no_new_privileges=False, pids_limit=None
             ),
         )
+
+    def host_url(self, url: str) -> str:
+        """A relay-only guest reaches the public relay at `guest_relay_url`.
+
+        Host services publish the external relay URL; keep its whole capability
+        path and query, and change only the origin the guest dials.
+        """
+        from verifiers.v1.interception.tunnel import configured_host_tunnel
+
+        transport = getattr(configured_host_tunnel(), "config", None)
+        guest_url = self.config.guest_relay_url or getattr(
+            transport, "guest_relay_url", None
+        )
+        if not (self.network_restricted and guest_url):
+            return super().host_url(url)
+        public = urlsplit(
+            getattr(transport, "relay_url", None)
+            or os.environ.get("UCLOUD_RELAY_URL", "")
+        )
+        parsed = urlsplit(url)
+        if not public.netloc or (parsed.scheme, parsed.netloc) != (
+            public.scheme,
+            public.netloc,
+        ):
+            return super().host_url(url)
+        prefix = public.path.rstrip("/")
+        outside = parsed.path != prefix and not parsed.path.startswith(prefix + "/")
+        if prefix and outside:
+            return super().host_url(url)
+        guest = urlsplit(guest_url)
+        path = guest.path.rstrip("/") + parsed.path[len(prefix) :]
+        return urlunsplit(
+            (guest.scheme, guest.netloc, path, parsed.query, parsed.fragment)
+        )
+
+    async def prepare_execution(self, routes: list[str] | None) -> None:
+        """The gateway enforces the relay policy from creation onward: it cannot be
+        reopened for setup, and every agent route must be the relay's origin."""
+        if not self.network_restricted:
+            return
+        if routes is None:
+            raise SandboxError(
+                "Relay-only UCloud networking is immutable; setup must use baked or "
+                "staged dependencies"
+            )
+        relay = self.config.guest_relay_url or os.environ.get("UCLOUD_RELAY_URL", "")
+        try:
+            allowed = _relay_origin(relay)
+            if any(_relay_origin(_origin_of(route)) != allowed for route in routes):
+                raise ValueError
+        except ValueError:
+            raise SandboxError(
+                "Framework route is outside the configured UCloud relay origin"
+            ) from None
 
     async def run_program(
         self, argv: list[str], env: dict[str, str]

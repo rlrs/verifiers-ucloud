@@ -612,3 +612,54 @@ def test_images_resolve_by_registry_reference_or_gateway_name() -> None:
     )
     image = by_name._spec().image
     assert image.name == "tmax:task_000001" and image.tag is None
+
+
+def test_relay_only_sandboxes_ask_the_gateway_for_the_named_relay() -> None:
+    restricted = UCloudRuntime(UCloudRuntimeConfig(allow=[]), name="a")
+    assert restricted.network_restricted
+    policy = restricted._spec().to_dict()["network_policy"]
+    assert policy == {"egress": "relay", "relay": "default"}
+    open_box = UCloudRuntime(UCloudRuntimeConfig(), name="b")
+    assert not open_box.network_restricted
+    assert "network_policy" not in open_box._spec().to_dict()
+
+    with pytest.raises(ValueError, match="framework-only"):
+        UCloudRuntimeConfig(allow=["pypi.org"])
+    with pytest.raises(ValueError, match="bridge transport"):
+        UCloudRuntimeConfig(allow=[], network_access=False)
+    with pytest.raises(ValueError, match="HTTP"):
+        UCloudRuntimeConfig(allow=[], guest_relay_url="http://relay:8092/path")
+
+
+def test_relay_only_guests_reach_the_public_relay_at_its_guest_origin(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("UCLOUD_RELAY_URL", "https://relay.example/base")
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(allow=[], guest_relay_url="http://10.0.0.2:8092"), name="a"
+    )
+    url = "https://relay.example/base/managed/r1/v1?cap=1"
+    assert runtime.host_url(url) == "http://10.0.0.2:8092/managed/r1/v1?cap=1"
+    # Other origins, and paths outside the relay's prefix, are left alone.
+    assert runtime.host_url("https://other.example/v1") == "https://other.example/v1"
+    outside = "https://relay.example/elsewhere"
+    assert runtime.host_url(outside) == outside
+    open_box = UCloudRuntime(
+        UCloudRuntimeConfig(guest_relay_url="http://g:1"), name="b"
+    )
+    assert open_box.host_url(url) == url
+
+
+@pytest.mark.asyncio
+async def test_relay_only_execution_admits_only_relay_routes(monkeypatch) -> None:
+    monkeypatch.setenv("UCLOUD_RELAY_URL", "https://relay.example")
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(allow=[], guest_relay_url="http://10.0.0.2:8092"), name="a"
+    )
+    await runtime.prepare_execution(["http://10.0.0.2:8092/managed/r1/v1"])
+    with pytest.raises(SandboxError, match="outside"):
+        await runtime.prepare_execution(["http://10.0.0.2:9000/v1"])
+    with pytest.raises(SandboxError, match="immutable"):
+        await runtime.prepare_execution(None)
+    # An open sandbox has nothing to enforce.
+    await UCloudRuntime(UCloudRuntimeConfig(), name="b").prepare_execution(None)
