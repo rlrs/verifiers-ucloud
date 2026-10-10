@@ -2265,10 +2265,10 @@ wheels = [
 
 [[package]]
 name = "ucloud-sandboxes-sdk"
-version = "0.4.37"
-source = { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.37/ucloud_sandboxes_sdk-0.4.37-py3-none-any.whl" }
+version = "0.4.38"
+source = { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.38/ucloud_sandboxes_sdk-0.4.38-py3-none-any.whl" }
 wheels = [
-    { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.37/ucloud_sandboxes_sdk-0.4.37-py3-none-any.whl", hash = "sha256:63321d13ec52347526a341871eec2167279b5d2a3e672e893f56725bb584d04f" },
+    { url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.38/ucloud_sandboxes_sdk-0.4.38-py3-none-any.whl", hash = "sha256:32c2c5405f67048f65881b68cbc4e9747210b989440efb2664c1099ed50705f2" },
 ]
 
 [package.optional-dependencies]
@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "verifiers-ucloud"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "ucloud-sandboxes-sdk", extra = ["async"] },
@@ -2357,7 +2357,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ucloud-sandboxes-sdk", extras = ["async"], url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.37/ucloud_sandboxes_sdk-0.4.37-py3-none-any.whl" },
+    { name = "ucloud-sandboxes-sdk", extras = ["async"], url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.38/ucloud_sandboxes_sdk-0.4.38-py3-none-any.whl" },
     { name = "verifiers", git = "https://github.com/rlrs/verifiers?rev=v0.3.1.post1" },
 ]
 

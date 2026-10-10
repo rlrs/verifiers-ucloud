@@ -1535,3 +1535,58 @@ def test_offline_bundles_over_the_upload_limit_are_refused(
     monkeypatch.setattr(offline_module, "MAX_FILE_BODY_BYTES", 16)
     with pytest.raises(SandboxError, match="upload limit"):
         offline_module.read_harness_bundle(str(archive))
+
+
+class _IndexClient:
+    base_url = "https://gateway.example"
+    summary: ClassVar[dict] = {
+        "environments": {
+            "(none)": {"names": 2, "tasks": 0, "states": {"ready": 2}},
+            "tmax": {"names": 3, "tasks": 3, "states": {"not_built": 2, "failed": 1}},
+            "r2e-gym": {"names": 1, "tasks": 1, "states": {"ready": 1}},
+        },
+        "totals": {"names": 6, "tasks": 4},
+    }
+
+    @classmethod
+    def from_env(cls, *, timeout_seconds):
+        return cls()
+
+    def image_index_summary(self):
+        return self.summary
+
+    def image_index_task_ids(self, environment):
+        assert environment != "(none)"
+        ids = {"tmax": ["task_1", "task_2"], "r2e-gym": ["abc123"]}[environment]
+        excluded = {"failed": 1} if environment == "tmax" else {}
+        return {"environment": environment, "task_ids": ids, "excluded": excluded}
+
+
+def test_task_ids_command_writes_each_environments_task_ids_file(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    import json
+
+    import verifiers_ucloud.cli as cli
+
+    monkeypatch.setattr(cli, "SandboxClient", _IndexClient)
+    out = tmp_path / "allowlists"
+    assert cli.main(["task-ids", str(out)]) == 0
+    assert json.loads((out / "tmax.task-ids.json").read_text()) == ["task_1", "task_2"]
+    assert json.loads((out / "r2e-gym.task-ids.json").read_text()) == ["abc123"]
+    assert not (out / "(none).task-ids.json").exists()
+    report = json.loads((out / "summary.json").read_text())
+    assert report["environments"]["tmax"] == {"task_ids": 2, "excluded": {"failed": 1}}
+    assert "excluded {'failed': 1}" in capsys.readouterr().out
+
+    one = tmp_path / "one"
+    assert cli.main(["task-ids", str(one), "-e", "r2e-gym"]) == 0
+    assert [path.name for path in sorted(one.iterdir())] == [
+        "r2e-gym.task-ids.json",
+        "summary.json",
+    ]
+    assert cli.main(["task-ids", str(one), "-e", "nope"]) == 2
+
+    assert cli.main(["summary"]) == 0
+    table = capsys.readouterr().out
+    assert "tmax" in table and "failed" in table
