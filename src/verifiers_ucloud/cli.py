@@ -6,6 +6,8 @@
                             each environment's task_ids_file
                             (DIR/<environment>.task-ids.json) and DIR/summary.json;
                             --ready-only keeps only tasks whose image is built
+  ensure NAME ... [--from FILE]
+                            build images ahead (each image's state; repeat to poll)
 
 The gateway creates sandboxes only for image names in its index. Pass each
 environment's file as its taskset's `task_ids_file` so the trainer samples only
@@ -115,6 +117,24 @@ def task_ids(args: argparse.Namespace) -> int:
     return 0
 
 
+def ensure(args: argparse.Namespace) -> int:
+    from collections import Counter
+
+    names = list(args.names)
+    if args.from_file:
+        names += [
+            line.strip()
+            for line in args.from_file.read_text().splitlines()
+            if line.strip()
+        ]
+    statuses = _client().ensure_images(sorted(set(names)), timeout_seconds=300)
+    if args.json:
+        print(json.dumps(statuses, indent=1))
+    else:
+        print(json.dumps(dict(Counter(row.get("state") for row in statuses.values()))))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="verifiers-ucloud",
@@ -140,6 +160,11 @@ def main(argv: list[str] | None = None) -> int:
         help="only tasks whose image is built (no build wait at sandbox creation)",
     )
     export.set_defaults(func=task_ids)
+    build = commands.add_parser("ensure", help="build images ahead of the trainer")
+    build.add_argument("names", nargs="*", help="image names from the image index")
+    build.add_argument("--from", dest="from_file", type=Path, help="a file of names")
+    build.add_argument("--json", action="store_true", help="each image's state")
+    build.set_defaults(func=ensure)
     args = parser.parse_args(argv)
     return args.func(args)
 

@@ -1614,3 +1614,58 @@ def test_task_ids_ready_only_keeps_built_tasks(monkeypatch, tmp_path) -> None:
     report = json.loads((out / "summary.json").read_text())
     assert report["ready_only"] is True
     assert report["environments"]["tmax"]["excluded"] == {"not_built": 2, "failed": 1}
+
+
+@pytest.mark.asyncio
+async def test_prefetch_builds_upcoming_task_images_and_never_raises(caplog) -> None:
+    from verifiers_ucloud.prefetch import ImagePrefetcher, image_names
+
+    tasks = [
+        SimpleNamespace(data=SimpleNamespace(image="tmax/task_1:latest")),
+        SimpleNamespace(data=SimpleNamespace(image="tmax/task_1:latest")),
+        SimpleNamespace(data=SimpleNamespace(image=None)),
+        "openswe/x:latest",
+    ]
+    assert image_names(tasks) == ["openswe/x:latest", "tmax/task_1:latest"]
+    asked = []
+
+    class Client:
+        async def ensure_images(self, names, timeout_seconds=None):
+            asked.append(list(names))
+            return {name: {"state": "building"} for name in names}
+
+        async def close(self):
+            pass
+
+    prefetch = ImagePrefetcher(Client())
+    statuses = await prefetch.ensure(tasks)
+    assert asked == [["openswe/x:latest", "tmax/task_1:latest"]]
+    assert {row["state"] for row in statuses.values()} == {"building"}
+    assert (
+        await prefetch.ensure([SimpleNamespace(data=SimpleNamespace(image=None))]) == {}
+    )
+
+    class Down(Client):
+        async def ensure_images(self, names, timeout_seconds=None):
+            raise OSError("gateway unreachable")
+
+    assert await ImagePrefetcher(Down()).ensure(["tmax/task_2:latest"]) == {}
+    assert "image prefetch failed" in caplog.text
+
+
+def test_ensure_command_asks_for_named_images(monkeypatch, tmp_path, capsys) -> None:
+    import json
+
+    import verifiers_ucloud.cli as cli
+
+    class Client(_IndexClient):
+        def ensure_images(self, names, timeout_seconds=None):
+            return {
+                name: {"state": "ready" if "a" in name else "queued"} for name in names
+            }
+
+    monkeypatch.setattr(cli, "SandboxClient", Client)
+    listed = tmp_path / "names.txt"
+    listed.write_text("a:1\nb:1\n\n")
+    assert cli.main(["ensure", "a:1", "--from", str(listed)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"ready": 1, "queued": 1}

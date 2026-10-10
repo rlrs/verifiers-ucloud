@@ -5,14 +5,14 @@ UCloud sandbox runtime and relay-backed interception for verifiers v1.
 ## Install (this is the one thing a client needs)
 
 ```console
-uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.2"
+uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.3"
 ```
 
 That tag pins everything else:
 
 | Package | Version | From |
 |---|---|---|
-| `verifiers-ucloud` | 0.3.2 | this repository, tag `v0.3.2` |
+| `verifiers-ucloud` | 0.3.3 | this repository, tag `v0.3.3` |
 | `ucloud-sandboxes-sdk` | 0.4.38 | [release wheel](https://github.com/rlrs/ucloud-sandboxes-sdk/releases/tag/v0.4.38) |
 | `verifiers` | 0.3.1.post1: upstream `main` of 2026-09-08 plus the runtime-provider hooks and the LUMI RL harnesses | [`rlrs/verifiers` tag `v0.3.1.post1`](https://github.com/rlrs/verifiers/releases/tag/v0.3.1.post1) |
 
@@ -35,7 +35,25 @@ verifiers-ucloud summary                   # names and tasks per environment, by
 `task-ids` writes one file per environment in the index (`-e tmax` for just one) and
 `summary.json`. Tasks whose image failed to build are left out, so export again when
 the index changes. `--ready-only` keeps only tasks whose image is already built, so no
-rollout waits for a first-use build (minutes); export again as prebuilds finish. Both commands read `UCLOUD_SANDBOX_URL` and
+rollout waits for a first-use build (minutes); export again as prebuilds finish.
+
+## Building images before the trainer needs them
+
+A task whose image the gateway has not built yet waits for its build (minutes) at its
+first sandbox. A trainer that knows its next batches can ask for those builds now, so
+they overlap the current step:
+
+```python
+from verifiers_ucloud import ImagePrefetcher
+
+prefetch = ImagePrefetcher()
+await prefetch.ensure(tasks_for_the_next_steps)  # verifiers Tasks or image names
+```
+
+Call it a few steps ahead (a build takes 1-2 minutes; the gateway builds a few dozen
+at once). It is idempotent and never raises: a failure is logged and the sandbox
+create builds the image anyway. `ensure_task_images(...)` is the synchronous form, and
+`verifiers-ucloud ensure NAME ... [--from FILE]` does the same from a shell. Both commands read `UCLOUD_SANDBOX_URL` and
 `UCLOUD_SANDBOX_API_TOKEN`; in Python, the SDK client's `image_index_task_ids(env)`
 returns the same list.
 
