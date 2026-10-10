@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "verifiers-ucloud"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "." }
 dependencies = [
     { name = "ucloud-sandboxes-sdk", extra = ["async"] },

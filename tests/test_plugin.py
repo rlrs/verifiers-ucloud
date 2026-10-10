@@ -1561,6 +1561,13 @@ class _IndexClient:
         excluded = {"failed": 1} if environment == "tmax" else {}
         return {"environment": environment, "task_ids": ids, "excluded": excluded}
 
+    def image_index_names(self, *, environment=None, state=None, page_size=500):
+        assert (environment, state) == ("tmax", "ready")
+        return iter([{"name": "prime/tmax:task_2", "state": "ready"}])
+
+    def image_index_name(self, name):
+        return {"name": name, "task_ids": ["task_2"]}
+
 
 def test_task_ids_command_writes_each_environments_task_ids_file(
     monkeypatch, tmp_path, capsys
@@ -1590,3 +1597,20 @@ def test_task_ids_command_writes_each_environments_task_ids_file(
     assert cli.main(["summary"]) == 0
     table = capsys.readouterr().out
     assert "tmax" in table and "failed" in table
+
+
+def test_task_ids_ready_only_keeps_built_tasks(monkeypatch, tmp_path) -> None:
+    import json
+
+    import verifiers_ucloud.cli as cli
+
+    monkeypatch.setattr(cli, "SandboxClient", _IndexClient)
+    out = tmp_path / "ready"
+    assert cli.main(["task-ids", str(out), "--ready-only"]) == 0
+    # tmax has unbuilt and failed names: only its ready name's tasks remain.
+    assert json.loads((out / "tmax.task-ids.json").read_text()) == ["task_2"]
+    # r2e-gym is all ready: its full list, as without --ready-only.
+    assert json.loads((out / "r2e-gym.task-ids.json").read_text()) == ["abc123"]
+    report = json.loads((out / "summary.json").read_text())
+    assert report["ready_only"] is True
+    assert report["environments"]["tmax"]["excluded"] == {"not_built": 2, "failed": 1}

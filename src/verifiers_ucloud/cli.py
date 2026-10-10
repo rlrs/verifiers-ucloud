@@ -2,8 +2,10 @@
 
   summary                   the gateway's image index: names and tasks per
                             environment, by state
-  task-ids DIR [-e ENV ...] each environment's task_ids_file
-                            (DIR/<environment>.task-ids.json) and DIR/summary.json
+  task-ids DIR [-e ENV ...] [--ready-only]
+                            each environment's task_ids_file
+                            (DIR/<environment>.task-ids.json) and DIR/summary.json;
+                            --ready-only keeps only tasks whose image is built
 
 The gateway creates sandboxes only for image names in its index. Pass each
 environment's file as its taskset's `task_ids_file` so the trainer samples only
@@ -16,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ucloud_sandboxes_sdk import SandboxClient
@@ -53,6 +56,27 @@ def summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ready_task_ids(client: SandboxClient, environment: str, row: dict) -> dict:
+    """The tasks whose image name is ready now, so a sandbox for them starts
+    without waiting for a build; `excluded` counts the other names, by state."""
+    states = row.get("states", {})
+    if states.get("ready", 0) == row.get("names", 0):
+        return client.image_index_task_ids(environment)
+    ready = [
+        entry["name"]
+        for entry in client.image_index_names(
+            environment=environment, state="ready", page_size=5000
+        )
+    ]
+    with ThreadPoolExecutor(16) as pool:
+        details = list(pool.map(client.image_index_name, ready))
+    ids = sorted({task for detail in details if detail for task in detail["task_ids"]})
+    excluded = {
+        state: count for state, count in states.items() if state != "ready" and count
+    }
+    return {"environment": environment, "task_ids": ids, "excluded": excluded}
+
+
 def task_ids(args: argparse.Namespace) -> int:
     client = _client()
     index = client.image_index_summary()
@@ -62,17 +86,27 @@ def task_ids(args: argparse.Namespace) -> int:
         print(f"not in the image index: {', '.join(unknown)}", file=sys.stderr)
         return 2
     args.directory.mkdir(parents=True, exist_ok=True)
-    report: dict = {"gateway": client.base_url, "environments": {}}
+    # Without --ready-only, `excluded` counts tasks (failed names'); with it, names.
+    report: dict = {
+        "gateway": client.base_url,
+        "ready_only": args.ready_only,
+        "environments": {},
+    }
     for environment in args.environment or known:
-        answer = client.image_index_task_ids(environment)
+        if args.ready_only:
+            answer = _ready_task_ids(
+                client, environment, index["environments"][environment]
+            )
+        else:
+            answer = client.image_index_task_ids(environment)
         if not answer["task_ids"]:
             continue
         _write(args.directory / f"{environment}.task-ids.json", answer["task_ids"])
+        excluded = answer["excluded"]
         report["environments"][environment] = {
             "task_ids": len(answer["task_ids"]),
-            "excluded": answer["excluded"],
+            "excluded": excluded,
         }
-        excluded = answer["excluded"]
         print(
             f"{environment:<16} {len(answer['task_ids']):>8,} task ids"
             + (f"  excluded {excluded}" if excluded else "")
@@ -99,6 +133,11 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         help="only this environment (repeatable)",
+    )
+    export.add_argument(
+        "--ready-only",
+        action="store_true",
+        help="only tasks whose image is built (no build wait at sandbox creation)",
     )
     export.set_defaults(func=task_ids)
     args = parser.parse_args(argv)
