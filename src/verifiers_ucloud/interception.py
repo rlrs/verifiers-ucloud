@@ -39,8 +39,10 @@ class UCloudInterceptionConfig(BaseInterceptionConfig):
     type: Literal["ucloud"] = "ucloud"
     relay_url: str | None = None
     guest_relay_url: str | None = None
-    """The relay origin as relay-only sandboxes reach it, when that differs from the
-    public relay URL; UCloudRuntime.host_url rewrites guests' relay URLs to it."""
+    """The relay origin as sandboxes reach it, when that differs from the public relay
+    URL (on UCloud, the gateway's private address): UCloudRuntime.host_url rewrites
+    guests' relay URLs to it. Needed for relay-only sandboxes, and for any sandbox to
+    pause through its model calls, which its node sees only at that address."""
     poll_timeout_seconds: float = 10.0
     lease_seconds: float = 900.0
     forward_timeout_seconds: float = 300.0

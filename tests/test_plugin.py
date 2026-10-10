@@ -641,7 +641,7 @@ def test_relay_only_sandboxes_ask_the_gateway_for_the_named_relay() -> None:
         UCloudRuntimeConfig(allow=[], guest_relay_url="http://relay:8092/path")
 
 
-def test_relay_only_guests_reach_the_public_relay_at_its_guest_origin(
+def test_guests_reach_the_public_relay_at_its_guest_origin(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("UCLOUD_RELAY_URL", "https://relay.example/base")
@@ -654,10 +654,14 @@ def test_relay_only_guests_reach_the_public_relay_at_its_guest_origin(
     assert runtime.host_url("https://other.example/v1") == "https://other.example/v1"
     outside = "https://relay.example/elsewhere"
     assert runtime.host_url(outside) == outside
+    # Open egress too: a node sees (and pauses through) model calls only at the
+    # relay's private address.
     open_box = UCloudRuntime(
-        UCloudRuntimeConfig(guest_relay_url="http://g:1"), name="b"
+        UCloudRuntimeConfig(guest_relay_url="http://10.0.0.2:8092"), name="b"
     )
-    assert open_box.host_url(url) == url
+    assert open_box.host_url(url) == "http://10.0.0.2:8092/managed/r1/v1?cap=1"
+    unset = UCloudRuntime(UCloudRuntimeConfig(), name="c")
+    assert unset.host_url(url) == url
 
 
 @pytest.mark.asyncio
@@ -1395,33 +1399,43 @@ def _managed_process(job, **runtime_attrs):
 
 
 @pytest.mark.asyncio
-async def test_interactive_output_is_read_to_its_end_after_the_process_exits() -> None:
-    reads = [b"first", b"", b"last reply"]
-    log = b"".join(reads)
+async def test_a_waiting_process_is_polled_without_reading_its_log(monkeypatch) -> None:
+    import verifiers_ucloud.managed_process as managed
 
-    class ExitingJob:
+    monkeypatch.setattr(managed, "_POLL_SECONDS", 0)
+    log = b"first|last reply"
+    # stdout byte counts the job status answers, poll by poll: output, a long wait
+    # (the model call), then the last reply written just before the job ends.
+    timeline = [(6, False), (6, False), (6, False), (6, False), (16, False), (16, True)]
+
+    class Job:
         sandbox_id, job_id = "sandbox", "job"
 
         def __init__(self) -> None:
-            self.reads, self.refreshes = 0, 0
-
-        async def logs(self, stream, *, offset=0):
-            end = len(b"".join(reads[: self.reads + 1]))
-            self.reads += 1
-            return SimpleNamespace(data=log[offset:end], next_offset=end, eof=True)
+            self.polls, self.reads = 0, []
 
         async def refresh(self):
-            # The process exits after its first output; its last reply lands in
-            # the log after the read that found the log's end.
-            self.refreshes += 1
+            size, terminal = timeline[min(self.polls, len(timeline) - 1)]
+            self.polls += 1
             return SimpleNamespace(
-                terminal=self.refreshes > 1,
+                terminal=terminal,
+                stdout_bytes=size,
+                stderr_bytes=0,
                 stdout_truncated=False,
                 stderr_truncated=False,
             )
 
-    process = _managed_process(ExitingJob())
-    assert b"".join([chunk async for chunk in process.stdout]) == b"firstlast reply"
+        async def logs(self, stream, *, offset=0):
+            self.reads.append(offset)
+            end = timeline[min(self.polls, len(timeline)) - 1][0]
+            return SimpleNamespace(data=log[offset:end], next_offset=end, eof=True)
+
+    job = Job()
+    process = _managed_process(job)
+    assert b"".join([chunk async for chunk in process.stdout]) == log
+    # The log (a waking read) was read only when the status showed new bytes.
+    assert job.reads == [0, 6]
+    assert job.polls == len(timeline)
 
 
 @pytest.mark.asyncio

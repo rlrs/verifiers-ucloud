@@ -60,6 +60,8 @@ sys.exit(128 - code if code < 0 else code)  # A signalled child exits 128+N.
 """
 
 _TRANSITIONS = {"parked", "parking", "unparking", "resuming", "waking", "suspending"}
+# How often a waiting stream asks the job's status (which never wakes the sandbox).
+_POLL_SECONDS = 1.0
 
 
 async def _job_call(operation, what: str):
@@ -122,49 +124,46 @@ class ManagedProcess(RuntimeProcess):
         return cls(runtime, job, mailbox)
 
     async def _logs(self, stream: str):
+        """The stream's output as it is written. Waiting polls the job's status,
+        which never wakes the sandbox; the log, whose reads do wake it, is read
+        only once the status shows new bytes. A paused or parked sandbox
+        therefore stays so while its process waits for the model."""
         client = self.runtime._client_or_raise()
         offset = 0
-        ended = False  # The job ended: read its log to the end, then stop.
         while True:
-            state = await _job_call(
-                client.get_sandbox_status(self.job.sandbox_id), "status"
-            )
-            if state is None:
-                raise SandboxError("Managed process sandbox no longer exists")
-            if state.get("state") in _TRANSITIONS:
-                await asyncio.sleep(2)
-                continue
-            try:
-                chunk = await with_relay(
-                    read_managed_logs(self.job, stream, offset=offset)
+            record = await _job_call(self.job.refresh(), "status")
+            if record.stdout_truncated or record.stderr_truncated:
+                raise SandboxError("Managed interactive process output truncated")
+            # Byte counts are as of the status: after the job ends they are final.
+            available = getattr(record, f"{stream}_bytes", 0)
+            while offset < available:
+                state = await _job_call(
+                    client.get_sandbox_status(self.job.sandbox_id), "status"
                 )
-            except SandboxApiError as error:
-                in_transition = "lifecycle transition is in progress" in str(error)
-                if error.status_code == 400 and in_transition:
+                if state is None:
+                    raise SandboxError("Managed process sandbox no longer exists")
+                if state.get("state") in _TRANSITIONS:
                     await asyncio.sleep(2)
                     continue
-                raise SandboxError(
-                    f"Managed interactive process {stream} read failed: {error}"
-                ) from error
-            stalled = chunk.data and chunk.next_offset <= offset
-            if chunk.next_offset < offset or stalled:
-                raise SandboxError("Managed process log cursor did not advance")
-            offset = chunk.next_offset
-            if chunk.data:
+                try:
+                    chunk = await with_relay(
+                        read_managed_logs(self.job, stream, offset=offset)
+                    )
+                except SandboxApiError as error:
+                    transition = "lifecycle transition is in progress" in str(error)
+                    if error.status_code == 400 and transition:
+                        await asyncio.sleep(2)
+                        continue
+                    raise SandboxError(
+                        f"Managed interactive process {stream} read failed: {error}"
+                    ) from error
+                if chunk.next_offset <= offset:
+                    raise SandboxError("Managed process log cursor did not advance")
+                offset = chunk.next_offset
                 yield chunk.data
-            if chunk.eof:
-                if ended:
-                    return
-                record = await _job_call(self.job.refresh(), "status")
-                if record.stdout_truncated or record.stderr_truncated:
-                    raise SandboxError("Managed interactive process output truncated")
-                if record.terminal:
-                    # `eof` is the log's end as of that read: what the process wrote
-                    # before it exited (ACP's last reply) may have landed since.
-                    ended = True
-                    continue
-            if not chunk.data:
-                await asyncio.sleep(2)
+            if record.terminal:
+                return
+            await asyncio.sleep(_POLL_SECONDS)
 
     async def write(self, data: bytes) -> None:
         async with self._write_lock:

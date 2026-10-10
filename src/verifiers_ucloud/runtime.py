@@ -99,8 +99,10 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     relay_name: str = Field(default="default", pattern=r"^[a-z][a-z0-9-]{0,31}$")
     """The gateway relay a relay-only sandbox may reach (`allow = []`)."""
     guest_relay_url: str | None = None
-    """The relay origin as a relay-only sandbox reaches it, when that differs from
-    `UCLOUD_RELAY_URL` (e.g. the gateway's private address)."""
+    """The relay origin as sandboxes reach it, when that differs from
+    `UCLOUD_RELAY_URL` (on UCloud, the gateway's private address). Relay-only
+    sandboxes need it, and any sandbox pauses through its model calls only when
+    they go there."""
     cpu: float = 1.0
     memory: float = 2.0
     gpu: str | None = None
@@ -419,13 +421,13 @@ class UCloudRuntime(Runtime):
         return public, guest
 
     def host_url(self, url: str) -> str:
-        """A relay-only guest reaches the public relay at `guest_relay_url`.
+        """A guest reaches the public relay at `guest_relay_url`, when set.
 
         Host services publish the external relay URL; keep its whole capability
-        path and query, and change only the origin the guest dials.
+        path and query, and change only the origin the guest dials. A relay-only
+        guest can reach nothing else; any guest's node pauses the sandbox through
+        its model calls only when they go to the relay's private address.
         """
-        if not self.network_restricted:
-            return super().host_url(url)
         public_url, guest_url = self._relay_urls()
         if not guest_url:
             return super().host_url(url)

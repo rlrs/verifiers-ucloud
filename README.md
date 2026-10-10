@@ -5,14 +5,14 @@ UCloud sandbox runtime and relay-backed interception for verifiers v1.
 ## Install (this is the one thing a client needs)
 
 ```console
-uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.3"
+uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.4"
 ```
 
 That tag pins everything else:
 
 | Package | Version | From |
 |---|---|---|
-| `verifiers-ucloud` | 0.3.3 | this repository, tag `v0.3.3` |
+| `verifiers-ucloud` | 0.3.4 | this repository, tag `v0.3.4` |
 | `ucloud-sandboxes-sdk` | 0.4.38 | [release wheel](https://github.com/rlrs/ucloud-sandboxes-sdk/releases/tag/v0.4.38) |
 | `verifiers` | 0.3.1.post1: upstream `main` of 2026-09-08 plus the runtime-provider hooks and the LUMI RL harnesses | [`rlrs/verifiers` tag `v0.3.1.post1`](https://github.com/rlrs/verifiers/releases/tag/v0.3.1.post1) |
 
@@ -64,14 +64,21 @@ verifiers discovers them from the normal config types:
 [env.agent.runtime]
 type = "ucloud"
 image = "python:3.11-slim"
+image_reference_type = "name"   # task images are gateway image-index names
 cpu = 2
 memory = 4
+park_interactive = true          # ACP harnesses (OpenCode, Pi) park too
 
 [env.interception]
 type = "ucloud"
+guest_relay_url = "http://10.36.101.16:8092"   # the relay's private address on UCloud
 ```
 
 `image` is only the runtime default; each environment can select its own image.
+
+**Set `guest_relay_url` to the relay's private address.** A sandbox's node pauses it
+through a model call only when the call goes to that address; through the public relay
+URL the call works but the sandbox stays resident for the whole wait.
 
 Set `UCLOUD_SANDBOX_URL` and, when required,
 `UCLOUD_SANDBOX_API_TOKEN` for the sandbox gateway. Set `UCLOUD_RELAY_URL` and,
