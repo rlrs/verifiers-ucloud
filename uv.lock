@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.12' and sys_platform == 'win32'",
@@ -13,9 +13,9 @@ resolution-markers = [
 [options]
 
 [options.exclude-newer-package]
-prime-tunnel = false
 prime-pydantic-config = false
 prime-sandboxes = false
+prime-tunnel = false
 renderers = false
 
 [[package]]
@@ -2308,8 +2308,8 @@ wheels = [
 
 [[package]]
 name = "verifiers"
-version = "0.2.1.post2.dev60"
-source = { git = "https://github.com/rlrs/verifiers?rev=1702110b2cadd99685f87cf3014685b22294d13d#1702110b2cadd99685f87cf3014685b22294d13d" }
+version = "0.3.1.post1"
+source = { git = "https://github.com/rlrs/verifiers?rev=v0.3.1.post1#29ea1a32f22cc5eda385579573a1d890f9c3e49c" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "verifiers-ucloud"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "ucloud-sandboxes-sdk", extra = ["async"] },
@@ -2358,7 +2358,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ucloud-sandboxes-sdk", extras = ["async"], url = "https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.37/ucloud_sandboxes_sdk-0.4.37-py3-none-any.whl" },
-    { name = "verifiers", git = "https://github.com/rlrs/verifiers?rev=1702110b2cadd99685f87cf3014685b22294d13d" },
+    { name = "verifiers", git = "https://github.com/rlrs/verifiers?rev=v0.3.1.post1" },
 ]
 
 [package.metadata.requires-dev]

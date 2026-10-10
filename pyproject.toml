@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "verifiers-ucloud"
-version = "0.2.0"
+version = "0.3.0"
 description = "UCloud sandbox runtime and relay interception for verifiers"
 readme = "README.md"
 license = "MIT"
@@ -12,9 +12,8 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "ucloud-sandboxes-sdk[async] @ https://github.com/rlrs/ucloud-sandboxes-sdk/releases/download/v0.4.37/ucloud_sandboxes_sdk-0.4.37-py3-none-any.whl",
     # The rlrs fork: upstream verifiers plus the runtime-provider hooks this package
-    # uses and the harnesses LUMI RL trains with. Branch feat/lumi-harnesses-20261009;
-    # replace the commit with its release tag.
-    "verifiers @ git+https://github.com/rlrs/verifiers@1702110b2cadd99685f87cf3014685b22294d13d",
+    # uses and the harnesses LUMI RL trains with.
+    "verifiers @ git+https://github.com/rlrs/verifiers@v0.3.1.post1",
 ]
 
 [dependency-groups]
