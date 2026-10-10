@@ -5,14 +5,14 @@ UCloud sandbox runtime and relay-backed interception for verifiers v1.
 ## Install (this is the one thing a client needs)
 
 ```console
-uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.4"
+uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.5"
 ```
 
 That tag pins everything else:
 
 | Package | Version | From |
 |---|---|---|
-| `verifiers-ucloud` | 0.3.4 | this repository, tag `v0.3.4` |
+| `verifiers-ucloud` | 0.3.5 | this repository, tag `v0.3.5` |
 | `ucloud-sandboxes-sdk` | 0.4.38 | [release wheel](https://github.com/rlrs/ucloud-sandboxes-sdk/releases/tag/v0.4.38) |
 | `verifiers` | 0.3.1.post1: upstream `main` of 2026-09-08 plus the runtime-provider hooks and the LUMI RL harnesses | [`rlrs/verifiers` tag `v0.3.1.post1`](https://github.com/rlrs/verifiers/releases/tag/v0.3.1.post1) |
 
@@ -155,8 +155,10 @@ lost response acknowledgement is re-sent with the same bytes rather than regener
 rollout's relay worker failure fails that rollout's current sandbox operation as a
 `TunnelError`; a host tool relay that fails is restarted on the same session, so it fails
 only the tool calls in flight. File transfers retry the node's admission refusals (CPU or
-memory pressure). `repair_loopback_hosts = true` adds `localhost` to /etc/hosts for images
-that ship an empty one.
+memory pressure). `localhost` and the sandbox's hostname are added to /etc/hosts when the
+image does not resolve them, as Docker provides them (`repair_loopback_hosts`, on by
+default). A managed sandbox's /tmp is a tmpfs of half its memory (`tmp_mb`), not the
+gateway's 64 MiB default: graders install uv and packages there.
 
 `toolkits = ["vf-harness:latest"]` asks the gateway to stack read-only toolkits (at most
 4) on each rollout's image under `/opt/ucloud/toolkits/<name>`. `uv_toolkit` names one

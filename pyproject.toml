@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "verifiers-ucloud"
-version = "0.3.4"
+version = "0.3.5"
 description = "UCloud sandbox runtime and relay interception for verifiers"
 readme = "README.md"
 license = "MIT"

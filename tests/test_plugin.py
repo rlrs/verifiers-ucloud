@@ -148,7 +148,11 @@ class _SandboxClient:
         return _Sandbox(spec.id, {"spec": spec.to_dict(), "generation": 1})
 
     async def exec(self, sandbox_id: str, command: list[str], **kwargs):
-        self.execs.append((sandbox_id, command, kwargs))
+        # The loopback check (one per sandbox start) has its own tests.
+        if command[:2] != ["sh", "-c"] or "getent hosts localhost" not in command[2]:
+            self.execs.append((sandbox_id, command, kwargs))
+        else:
+            self.loopback_checks = getattr(self, "loopback_checks", 0) + 1
         return _Result()
 
     async def open_process(self, sandbox_id: str, command: list[str], **kwargs):
@@ -568,6 +572,29 @@ def test_toolkits_reach_the_sandbox_spec_in_both_sandbox_shapes() -> None:
         assert runtime._spec().to_dict()["toolkits"] == ["vf-harness:v1"]
 
 
+def test_managed_sandboxes_get_a_tmp_graders_can_install_into() -> None:
+    spec = UCloudRuntime(UCloudRuntimeConfig(memory=4), name="a")._spec().to_dict()
+    assert spec["filesystem"]["tmpfs_mb"] == 2048  # half of memory, not 64 MiB
+    sized = UCloudRuntime(UCloudRuntimeConfig(tmp_mb=512), name="b")._spec().to_dict()
+    assert sized["filesystem"]["tmpfs_mb"] == 512
+
+
+def test_ready_only_refuses_a_cut_task_list(monkeypatch, tmp_path) -> None:
+    import verifiers_ucloud.cli as cli
+
+    class Client(_IndexClient):
+        def image_index_name(self, name):
+            return {
+                "name": name,
+                "tasks": 150,
+                "task_ids": [f"t{i}" for i in range(100)],
+            }
+
+    monkeypatch.setattr(cli, "SandboxClient", Client)
+    with pytest.raises(SystemExit, match="more than 100 tasks"):
+        cli.main(["task-ids", str(tmp_path / "out"), "--ready-only", "-e", "tmax"])
+
+
 def test_a_uv_toolkit_prepares_uv_scripts_and_must_be_requested() -> None:
     runtime = UCloudRuntime(
         UCloudRuntimeConfig(toolkits=["vf-harness:v1"], uv_toolkit="vf-harness"),
@@ -728,18 +755,17 @@ async def test_loopback_hosts_are_repaired_only_when_asked(monkeypatch) -> None:
 
     monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
     monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
-    plain = UCloudRuntime(UCloudRuntimeConfig(group_create=False), name="plain")
+    plain = UCloudRuntime(
+        UCloudRuntimeConfig(group_create=False, repair_loopback_hosts=False),
+        name="plain",
+    )
     await plain.start()
     assert _SandboxClient.instances[-1].execs == []
     await plain.stop()
 
-    repaired = UCloudRuntime(
-        UCloudRuntimeConfig(group_create=False, repair_loopback_hosts=True),
-        name="repaired",
-    )
-    await repaired.start()
-    (_, command, _) = _SandboxClient.instances[-1].execs[-1]
-    assert command[:2] == ["sh", "-c"] and "getent hosts localhost" in command[2]
+    repaired = UCloudRuntime(UCloudRuntimeConfig(group_create=False), name="repaired")
+    await repaired.start()  # on by default, as Docker provides localhost
+    assert _SandboxClient.instances[-1].loopback_checks == 1
     await repaired.stop()
 
 

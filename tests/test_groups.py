@@ -134,7 +134,10 @@ def gateway(monkeypatch) -> Iterator[Gateway]:
 
 
 def runtimes(count: int, **config: Any) -> list[UCloudRuntime]:
-    settings = UCloudRuntimeConfig(request_timeout_seconds=5, **config)
+    # These tests count gateway calls; the loopback check has its own tests.
+    settings = UCloudRuntimeConfig(
+        request_timeout_seconds=5, **{"repair_loopback_hosts": False, **config}
+    )
     return [UCloudRuntime(settings, name=f"rollout-{i}") for i in range(count)]
 
 

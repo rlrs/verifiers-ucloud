@@ -22,6 +22,7 @@ from ucloud_sandboxes_sdk import (
     Image,
     SandboxApiError,
     SandboxClient,
+    SandboxFilesystemSpec,
     SandboxNetworkPolicy,
     SandboxSecuritySpec,
     SandboxSpec,
@@ -107,6 +108,11 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     memory: float = 2.0
     gpu: str | None = None
     disk: float = 5.0
+    tmp_mb: int | None = Field(None, gt=0)
+    """Size of the managed sandbox's /tmp (a tmpfs, in its memory), in MiB. Default:
+    half of `memory`. Docker's /tmp is disk, and graders install uv and packages
+    there: the gateway's 64 MiB default fills, and a full /tmp also fails the reward
+    read (verifiers' bounded read stages through /tmp)."""
     ttl_seconds: int = 24 * 60 * 60
     labels: dict[str, str] = Field(default_factory=dict)
     creates_per_sec: float | None = None
@@ -140,9 +146,11 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     so the sandbox can park while they wait for the model. Their interpreter must
     be one this runtime prepared with `prepare_uv_script`, as ACP's is. Needs
     `managed_agent`."""
-    repair_loopback_hosts: bool = False
+    repair_loopback_hosts: bool = True
     """After creation, add `localhost` and the sandbox's hostname to /etc/hosts when
-    the image does not resolve them (some extracted images ship an empty file)."""
+    the image does not resolve them, as Docker provides them (some extracted images
+    ship an empty file, and graders that reach `localhost` then score 0). One exec
+    per sandbox; nothing is written when they resolve."""
     toolkits: list[str] = Field(default_factory=list, max_length=4)
     """Read-only toolkits stacked on the image (``name:tag``): their files are under
     ``/opt/ucloud/toolkits/<name>``."""
@@ -400,6 +408,9 @@ class UCloudRuntime(Runtime):
             **common,
             managed_process=True,
             parkable=True,
+            filesystem=SandboxFilesystemSpec(
+                tmpfs_mb=self.config.tmp_mb or round(self.config.memory * 1024) // 2
+            ),
             security=SandboxSecuritySpec(
                 user="0:0", cap_drop=(), no_new_privileges=False, pids_limit=None
             ),

@@ -72,6 +72,14 @@ def _ready_task_ids(client: SandboxClient, environment: str, row: dict) -> dict:
     ]
     with ThreadPoolExecutor(16) as pool:
         details = list(pool.map(client.image_index_name, ready))
+    # A name's detail lists at most 100 of its tasks: never export a cut list.
+    cut = [d["name"] for d in details if d and d.get("tasks", 0) > len(d["task_ids"])]
+    if cut:
+        raise SystemExit(
+            f"{environment}: {len(cut)} ready names serve more than 100 tasks (e.g. "
+            f"{cut[0]}); --ready-only needs every name ready here, or a gateway that "
+            "filters task ids by state"
+        )
     ids = sorted({task for detail in details if detail for task in detail["task_ids"]})
     excluded = {
         state: count for state, count in states.items() if state != "ready" and count
