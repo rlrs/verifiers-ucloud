@@ -130,6 +130,39 @@ def read_harness_bundle(path: str) -> tuple[bytes, dict]:
     return blob, manifest
 
 
+# Each vf-* tree of the toolkit at /var/tmp/vf-*, where the harnesses install them.
+# A link already there is replaced; an image's own directory there is refused.
+_LINK_HARNESS_TREES = r"""
+set -eu
+toolkit=$1
+if [ ! -f "$toolkit/toolkit.json" ]; then
+    echo "$toolkit is not a harness toolkit" >&2; exit 1
+fi
+mkdir -p /var/tmp
+linked=0
+for tree in "$toolkit"/vf-*; do
+    [ -d "$tree" ] || continue
+    link=/var/tmp/${tree##*/}
+    if [ -e "$link" ] && [ ! -L "$link" ]; then
+        echo "$link already exists in the image" >&2; exit 1
+    fi
+    ln -sfn "$tree" "$link"
+    linked=$((linked + 1))
+done
+[ "$linked" -gt 0 ] || { echo "$toolkit holds no vf-* trees" >&2; exit 1; }
+"""
+
+
+async def link_harness_toolkit(runtime, name: str) -> None:
+    """Link the harness toolkit's trees where the harnesses look for them."""
+    toolkit = f"/opt/ucloud/toolkits/{name}"
+    result = await runtime.run(
+        ["sh", "-c", _LINK_HARNESS_TREES, "link-harness-toolkit", toolkit], {}
+    )
+    if result.exit_code:
+        raise SandboxError("Harness toolkit setup failed: " + result.stderr[-2000:])
+
+
 async def prepare_harness_bundle(runtime) -> None:
     """Unpack the harness bundle into the sandbox's root after its checksum."""
     blob, manifest = await asyncio.to_thread(

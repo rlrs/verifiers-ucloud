@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import ClassVar, cast
@@ -606,6 +608,66 @@ def test_a_uv_toolkit_prepares_uv_scripts_and_must_be_requested() -> None:
     assert UCloudRuntime(UCloudRuntimeConfig(), name="s").uv_env == {}
     with pytest.raises(ValueError, match="uv_toolkit"):
         UCloudRuntimeConfig(uv_toolkit="vf-harness")
+
+
+def test_a_harness_toolkit_must_be_requested_and_replaces_the_bundle(tmp_path) -> None:
+    UCloudRuntimeConfig(toolkits=["vf-agents:latest"], harness_toolkit="vf-agents")
+    with pytest.raises(ValueError, match="harness_toolkit must name"):
+        UCloudRuntimeConfig(harness_toolkit="vf-agents")
+    with pytest.raises(ValueError, match="replaces offline_harness_bundle"):
+        UCloudRuntimeConfig(
+            toolkits=["vf-agents:latest"],
+            harness_toolkit="vf-agents",
+            offline_harness_bundle=tmp_path / "agents.tar.gz",
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_harness_toolkit_links_its_trees_instead_of_uploading(
+    monkeypatch, tmp_path
+) -> None:
+    import verifiers_ucloud.runtime as runtime_module
+    from verifiers_ucloud.offline import _LINK_HARNESS_TREES
+
+    monkeypatch.setenv("UCLOUD_SANDBOX_URL", "https://gateway.example")
+    monkeypatch.setattr(runtime_module, "AsyncSandboxClient", _SandboxClient)
+    runtime = UCloudRuntime(
+        UCloudRuntimeConfig(
+            group_create=False,
+            toolkits=["vf-agents:latest"],
+            harness_toolkit="vf-agents",
+        ),
+        name="agents",
+    )
+    await runtime.start()
+    client = _SandboxClient.instances[-1]
+    try:
+        assert not client.uploads
+        command = client.execs[-1][1]
+        assert command[-1] == "/opt/ucloud/toolkits/vf-agents"
+        assert "ln -sfn" in command[2]
+    finally:
+        await runtime.stop()
+
+    # The link script itself, against a fake toolkit and /var/tmp in a scratch root.
+    toolkit = tmp_path / "toolkit"
+    (toolkit / "vf-pi").mkdir(parents=True)
+    (toolkit / "vf-node").mkdir()
+    (toolkit / "toolkit.json").write_text("{}")
+    script = _LINK_HARNESS_TREES.replace("/var/tmp", str(tmp_path / "var-tmp"))
+
+    def run() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["sh", "-c", script, "t", str(toolkit)], capture_output=True, text=True
+        )
+
+    assert run().returncode == 0
+    assert os.readlink(tmp_path / "var-tmp/vf-pi") == str(toolkit / "vf-pi")
+    assert run().returncode == 0  # Idempotent.
+    (tmp_path / "var-tmp/vf-node").unlink()
+    (tmp_path / "var-tmp/vf-node").mkdir()
+    refused = run()
+    assert refused.returncode == 1 and "already exists" in refused.stderr
 
 
 def test_unknown_runtime_and_interception_settings_are_rejected() -> None:

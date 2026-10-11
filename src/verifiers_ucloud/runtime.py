@@ -140,7 +140,13 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     scripts in relay-only sandboxes without a `uv_toolkit`."""
     offline_harness_bundle: Path | None = None
     """A pinned archive of harness assets (Node, OpenCode, Pi, ...) unpacked into
-    each sandbox after creation."""
+    each sandbox after creation. Prefer `harness_toolkit`: the bundle is written to
+    every sandbox's disk (several hundred MB in one burst)."""
+    harness_toolkit: str | None = None
+    """The toolkit (one of ``toolkits``, by name) holding the harness assets,
+    installed: its ``vf-*`` trees are linked to ``/var/tmp/vf-*``, where the
+    harnesses find themselves already installed. Nothing is copied into the
+    sandbox. Built by `runtime/toolkits/vf-agents/build.sh` in `ucloud-sandboxes`."""
     park_interactive: bool = False
     """Run live processes (`open_process`, e.g. an ACP agent) as managed jobs too,
     so the sandbox can park while they wait for the model. Their interpreter must
@@ -187,6 +193,15 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
         names = [ref.split("@")[0].split(":")[0] for ref in self.toolkits]
         if self.uv_toolkit is not None and self.uv_toolkit not in names:
             raise ValueError("uv_toolkit must name one of the requested toolkits")
+        if self.harness_toolkit is not None:
+            if self.harness_toolkit not in names:
+                raise ValueError(
+                    "harness_toolkit must name one of the requested toolkits"
+                )
+            if self.offline_harness_bundle is not None:
+                raise ValueError(
+                    "harness_toolkit replaces offline_harness_bundle; set one"
+                )
         return self
 
 
@@ -360,6 +375,10 @@ class UCloudRuntime(Runtime):
                 from .offline import prepare_harness_bundle
 
                 await prepare_harness_bundle(self)
+            if self.config.harness_toolkit is not None:
+                from .offline import link_harness_toolkit
+
+                await link_harness_toolkit(self, self.config.harness_toolkit)
         except Exception as exc:
             client, self._client = self._client, None
             if client is not None:

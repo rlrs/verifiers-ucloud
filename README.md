@@ -163,6 +163,14 @@ image does not resolve them, as Docker provides them (`repair_loopback_hosts`, o
 default). A managed sandbox's /tmp is a tmpfs of half its memory (`tmp_mb`), not the
 gateway's 64 MiB default: graders install uv and packages there.
 
+`harness_toolkit = "vf-agents"` (with `toolkits = ["vf-agents:latest"]`) takes the harness
+assets (Node, Pi, OpenCode) from a read-only toolkit instead of `offline_harness_bundle`: their
+`vf-*` trees are linked to `/var/tmp/vf-*`, already installed, so nothing is copied into the
+sandbox. A bundle writes its archive and its unpacked tree (0.5-0.7 GB) to every sandbox's
+disk in one burst, which can outrun the sandbox's disk growth (`No space left on device`).
+The toolkit is built from the bundles by `runtime/toolkits/vf-agents/build.sh` in
+`ucloud-sandboxes`.
+
 `toolkits = ["vf-harness:latest"]` asks the gateway to stack read-only toolkits (at most
 4) on each rollout's image under `/opt/ucloud/toolkits/<name>`. `uv_toolkit` names one
 of them whose uv, managed Python and prebuilt script environments verifiers uses to
