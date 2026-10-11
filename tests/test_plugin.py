@@ -1552,22 +1552,31 @@ class _Gateway:
         )
 
     def record(self):
-        return SimpleNamespace(
-            terminal=self.terminal,
+        from ucloud_sandboxes_sdk import SandboxJobRecord
+
+        return SandboxJobRecord(
+            sandbox_id="sandbox",
+            sandbox_generation=1,
+            job_id="job",
+            spec_sha256="0" * 64,
+            state="exited" if self.terminal else "running",
             exit_code=self.exit_code,
             stdout_bytes=len(self.out),
             stderr_bytes=len(self.err),
             stdout_truncated=self.truncated,
-            stderr_truncated=False,
+            cursor_from_server=self.carries_record,
+            retry_after=self.retry_after,
         )
 
     async def refresh(self):
         self.refreshes += 1
         return self.record()
 
-    async def _read_job_log_chunk(
+    async def read_job_logs(
         self, sandbox_id, job_id, *, stream, offset, limit, wait_seconds
     ):
+        from ucloud_sandboxes_sdk import SandboxJobLogChunk
+
         self.inflight += 1
         self.most_inflight = max(self.most_inflight, self.inflight)
         try:
@@ -1580,13 +1589,15 @@ class _Gateway:
             if held and offset >= len(log) and not self.terminal and self.steps:
                 self.steps.pop(0)(self)
             data = bytes(log[offset : offset + limit])
-            chunk = SimpleNamespace(
-                data=data,
+            return SandboxJobLogChunk(
+                stream=stream,
+                offset=offset,
                 next_offset=offset + len(data),
-                eof=self.terminal,
+                data=data,
+                eof=offset + len(data) >= len(log),
                 job=self.record() if self.carries_record else None,
+                retry_after=self.retry_after,
             )
-            return SimpleNamespace(chunk=chunk, retry_after=self.retry_after)
         finally:
             self.inflight -= 1
 
@@ -1691,10 +1702,8 @@ async def test_the_terminal_record_answers_wait_without_reading_output(sleeps) -
 
 @pytest.mark.asyncio
 async def test_a_large_terminal_log_is_read_page_by_page(monkeypatch, sleeps) -> None:
-    import verifiers_ucloud.managed_process as managed
     import verifiers_ucloud.recovery as recovery
 
-    monkeypatch.setattr(managed, "LOG_PAGE_BYTES", 4)
     monkeypatch.setattr(recovery, "LOG_PAGE_BYTES", 4)
     gateway = _Gateway(_step(out=b"0123456789", exit_code=0))
     process = _managed_process(gateway.job)

@@ -183,16 +183,15 @@ async def read_managed_log_page(job, stream, *, offset=0, wait_seconds=None):
     """`read_managed_logs`, but the gateway may hold the read for up to
     `wait_seconds` until the stream has bytes beyond `offset` or the job ends.
 
-    Returns the SDK's read: `.chunk` (whose `.job` is the job's record as of the
-    read, None from gateways before 0.9.72) and `.retry_after` (seconds, or None).
-    The SDK's public `read_job_logs` drops Retry-After, which a parked sandbox's
-    answer carries, so this calls the read under it; the SDK is pinned exactly.
+    The chunk's `.job` is the job's record as of the read (None from gateways
+    before 0.9.72), and `.retry_after` the answer's Retry-After (a parked
+    sandbox), if any.
     """
     return await _retrying_read(
         job,
         stream,
         offset,
-        lambda: job.client._read_job_log_chunk(
+        lambda: job.client.read_job_logs(
             job.sandbox_id,
             job.job_id,
             stream=stream,

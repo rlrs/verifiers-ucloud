@@ -13,13 +13,11 @@ import asyncio
 import time
 import uuid
 
-from ucloud_sandboxes_sdk import SandboxApiError
-from ucloud_sandboxes_sdk.client import DEFAULT_JOB_READ_WAIT_SECONDS, _job_follow_delay
+from ucloud_sandboxes_sdk import SandboxApiError, job_read_delay
 from verifiers.v1.errors import SandboxError, TunnelError
 from verifiers.v1.runtimes.base import RuntimeProcess
 
 from .recovery import (
-    LOG_PAGE_BYTES,
     RecoveryWindow,
     node_lost,
     read_managed_log_page,
@@ -69,7 +67,7 @@ sys.exit(128 - code if code < 0 else code)  # A signalled child exits 128+N.
 _TRANSITIONS = {"parked", "parking", "unparking", "resuming", "waking", "suspending"}
 # How long a log read may be held at the gateway until there is output (the
 # SDK's own follow() asks the same; the gateway caps a wait at 25 s).
-_WAIT_SECONDS = DEFAULT_JOB_READ_WAIT_SECONDS
+_WAIT_SECONDS = 20.0
 # Fallback pacing only: how long to pause after an answer that came back at once
 # without output (a gateway that does not hold reads), and how often to ask such
 # a gateway the job's status.
@@ -204,11 +202,10 @@ class ManagedProcess(RuntimeProcess):
         window = RecoveryWindow(self.job, _RECOVERY_SECONDS)
         while True:
             started = time.monotonic()
-            read = await self._read(
+            chunk = await self._read(
                 "stdout", offsets["stdout"], record, window, _WAIT_SECONDS
             )
             elapsed = time.monotonic() - started
-            chunk = read.chunk
             offsets["stdout"] = self._feed("stdout", offsets["stdout"], chunk, record)
             if chunk.job is None:
                 # A gateway before 0.9.72: its reads carry no record and are not
@@ -216,15 +213,13 @@ class ManagedProcess(RuntimeProcess):
                 return await self._poll_job(offsets, window)
             record = self._checked(chunk.job)
             await self._catch_up("stderr", offsets, record, window)
-            delay = _job_follow_delay(
+            # The SDK's pacing: None once the job ended and stdout is read to
+            # its end; a parked sandbox's Retry-After; a pause after an answer
+            # that came back at once without output; else read again at once.
+            delay = job_read_delay(
                 chunk,
-                record,
-                read.retry_after,
-                stream="stdout",
-                offset=offsets["stdout"],
-                limit=LOG_PAGE_BYTES,
-                requested=_WAIT_SECONDS,
-                elapsed=elapsed,
+                requested_seconds=_WAIT_SECONDS,
+                elapsed_seconds=elapsed,
                 poll_seconds=_POLL_SECONDS,
             )
             if delay is None:
@@ -255,8 +250,8 @@ class ManagedProcess(RuntimeProcess):
     async def _catch_up(self, stream, offsets, record, window) -> None:
         """Read `stream` up to the byte count `record` shows, without waiting."""
         while offsets[stream] < _bytes(record, stream):
-            read = await self._read(stream, offsets[stream], record, window, None)
-            offsets[stream] = self._feed(stream, offsets[stream], read.chunk, record)
+            chunk = await self._read(stream, offsets[stream], record, window, None)
+            offsets[stream] = self._feed(stream, offsets[stream], chunk, record)
 
     def _feed(self, stream: str, offset: int, chunk, record) -> int:
         """Queue a read's bytes; return the stream's next offset."""
@@ -281,7 +276,7 @@ class ManagedProcess(RuntimeProcess):
                 # the parked image, and reading them would wake the sandbox.
                 if offset < _bytes(record, stream):
                     await self._running()
-                read = await with_relay(
+                chunk = await with_relay(
                     read_managed_log_page(
                         self.job, stream, offset=offset, wait_seconds=wait_seconds
                     )
@@ -303,7 +298,7 @@ class ManagedProcess(RuntimeProcess):
                 await asyncio.sleep(_POLL_SECONDS)
                 continue
             window.succeeded()
-            return read
+            return chunk
 
     async def _running(self) -> None:
         """Raise _Transition unless the sandbox is running (its status never
