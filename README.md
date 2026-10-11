@@ -71,14 +71,17 @@ park_interactive = true          # ACP harnesses (OpenCode, Pi) park too
 
 [env.interception]
 type = "ucloud"
-guest_relay_url = "http://10.36.101.16:8092"   # the relay's private address on UCloud
+guest_relay_url = "http://sandbox-gateway-gateway-1:8092"  # the relay inside sandboxes (gateway 0.9.70+)
 ```
 
 `image` is only the runtime default; each environment can select its own image.
 
-**Set `guest_relay_url` to the relay's private address.** A sandbox's node pauses it
-through a model call only when the call goes to that address; through the public relay
-URL the call works but the sandbox stays resident for the whole wait.
+**Set `guest_relay_url` to the relay's name inside sandboxes.** Every sandbox reaches the
+gateway's relay by its VM's name, whatever its egress: the sandbox's `/etc/hosts` maps it to
+a fixed virtual address, which its node translates to the relay's current private address
+(that address changes when UCloud restarts the gateway VM). A sandbox's node pauses it
+through a model call only when the call goes there; through the public relay URL the call
+works but the sandbox stays resident for the whole wait.
 
 Set `UCLOUD_SANDBOX_URL` and, when required,
 `UCLOUD_SANDBOX_API_TOKEN` for the sandbox gateway. Set `UCLOUD_RELAY_URL` and,
@@ -136,7 +139,7 @@ registry reference: name an image recipe registered with the SDK's
 for the named relay policy (`relay_name`, default `default`) from creation: the sandbox
 reaches only the relay, and setup cannot reopen egress. Custom allow/block lists are
 refused. When guests reach the relay at a different origin than `UCLOUD_RELAY_URL` (the
-gateway's private address), set `guest_relay_url` on the runtime or the interception;
+relay's name inside sandboxes above), set `guest_relay_url` on the runtime or the interception;
 the runtime rewrites model and tool URLs to it. Relay-only sandboxes cannot install
 anything, so uv scripts come from `uv_toolkit` or `offline_python_bundle` (a pinned
 portable Python whose manifest lists the script digests it serves), and harness assets
