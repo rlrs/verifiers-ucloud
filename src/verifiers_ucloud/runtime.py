@@ -134,7 +134,9 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     disk by what it writes. False keeps a `linux_host` sandbox that runs the
     program as one exec."""
     agent_poll_seconds: float = Field(2.0, gt=0)
-    """How often a waiting `run_program` asks whether its managed program ended."""
+    """Fallback pacing for a waiting `run_program`: the gateway holds each status
+    read until its managed program's record changes, so this paces only gateways
+    that answer at once (before 0.9.72), and the retries of a failed read."""
     offline_python_bundle: Path | None = None
     """A pinned portable Python bundle (with `<bundle>.json`) that runs harness uv
     scripts in relay-only sandboxes without a `uv_toolkit`."""

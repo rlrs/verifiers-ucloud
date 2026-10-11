@@ -110,6 +110,14 @@ class _Job:
         data = {"stdout": b"agent out", "stderr": b"agent err"}[stream]
         return SimpleNamespace(data=data[offset:], next_offset=len(data), eof=True)
 
+    async def wait(self, *, poll_seconds: float = 1.0):
+        # The SDK's wait() long-polls; here each status read is a refresh().
+        while True:
+            record = await self.refresh()
+            if record.terminal:
+                return record
+            await asyncio.sleep(poll_seconds)
+
     async def signal(self, signal: int = 15):
         self.signals.append(signal)
 
@@ -953,26 +961,53 @@ def test_relay_commit_retries_only_transport_with_identical_payload(
     assert len(calls) == 1
 
 
-def test_a_briefly_unreachable_worker_is_polled_again_not_restarted() -> None:
+def _unreachable():
     from ucloud_sandboxes_sdk import SandboxApiError
 
+    return SandboxApiError(
+        "sandbox worker heartbeat is stale or unavailable",
+        status_code=503,
+        body={"error_code": "sandbox_worker_unreachable", "retryable": True},
+    )
+
+
+def test_a_briefly_unreachable_worker_is_polled_again_not_restarted() -> None:
     from verifiers_ucloud.recovery import wait_for_managed_job
 
     calls = []
 
-    async def refresh():
-        calls.append(1)
+    async def wait(*, poll_seconds):
+        calls.append(poll_seconds)
         if len(calls) == 1:
-            raise SandboxApiError(
-                "sandbox worker heartbeat is stale or unavailable",
-                status_code=503,
-                body={"error_code": "sandbox_worker_unreachable", "retryable": True},
-            )
+            raise _unreachable()
         return SimpleNamespace(terminal=True)
 
-    job = SimpleNamespace(refresh=refresh, sandbox_id="sandbox", job_id="job")
+    job = SimpleNamespace(wait=wait, record=None, sandbox_id="sandbox", job_id="job")
     assert asyncio.run(wait_for_managed_job(job, poll_seconds=0)).terminal
-    assert len(calls) == 2
+    # The SDK's held wait() is asked again with the fallback pacing.
+    assert calls == [0, 0]
+
+
+def test_the_recovery_window_restarts_after_a_successful_read(monkeypatch) -> None:
+    import verifiers_ucloud.recovery as recovery
+
+    now = [0.0]
+    monkeypatch.setattr(recovery, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    calls = []
+
+    async def wait(*, poll_seconds):
+        calls.append(now[0])
+        now[0] += 50
+        if len(calls) == 3:
+            job.record = SimpleNamespace(terminal=False)  # a read went through
+        raise _unreachable()
+
+    job = SimpleNamespace(wait=wait, record=None, sandbox_id="sandbox", job_id="job")
+    with pytest.raises(recovery.SandboxApiError, match="heartbeat"):
+        asyncio.run(recovery.wait_for_managed_job(job, poll_seconds=0))
+    # A run of failures starts at 50 s. A read that went through before the
+    # failure at 150 s starts a new run there, which the failure at 300 s ends.
+    assert calls == [0, 50, 100, 150, 200, 250]
 
 
 def test_a_deleted_sandbox_route_is_not_polled_again() -> None:
@@ -982,7 +1017,7 @@ def test_a_deleted_sandbox_route_is_not_polled_again() -> None:
 
     calls = []
 
-    async def refresh():
+    async def wait(*, poll_seconds):
         calls.append(1)
         raise SandboxApiError(
             "sandbox route not found",
@@ -990,7 +1025,7 @@ def test_a_deleted_sandbox_route_is_not_polled_again() -> None:
             body={"error": "sandbox route not found"},
         )
 
-    job = SimpleNamespace(refresh=refresh, sandbox_id="sandbox", job_id="job")
+    job = SimpleNamespace(wait=wait, record=None, sandbox_id="sandbox", job_id="job")
     with pytest.raises(SandboxApiError):
         asyncio.run(wait_for_managed_job(job, poll_seconds=0))
     assert len(calls) == 1
@@ -1008,7 +1043,7 @@ def test_node_loss_is_terminal_for_jobs_and_relay_commits(monkeypatch) -> None:
 
     calls = []
 
-    async def refresh():
+    async def wait(*, poll_seconds):
         calls.append("refresh")
         raise SandboxApiError(
             "sandbox route not found", status_code=404, body={"error_code": "node_lost"}
@@ -1023,7 +1058,7 @@ def test_node_loss_is_terminal_for_jobs_and_relay_commits(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(AsyncRelayWorkerClient, "_request_json", request)
-    job = SimpleNamespace(refresh=refresh, sandbox_id="sandbox", job_id="job")
+    job = SimpleNamespace(wait=wait, record=None, sandbox_id="sandbox", job_id="job")
     with pytest.raises(SandboxNodeLost, match="node_lost"):
         asyncio.run(wait_for_managed_job(job, poll_seconds=0))
     client = ResilientRelayWorkerClient("http://localhost")
@@ -1475,55 +1510,318 @@ async def test_a_cancelled_program_is_terminated_not_killed(monkeypatch) -> None
         await runtime.stop()
 
 
-def _managed_process(job, **runtime_attrs):
+def _managed_process(job, states=(), **runtime_attrs):
+    """A ManagedProcess for `job`; `states` are the sandbox states its status
+    answers, in turn, before "running"."""
     from verifiers_ucloud.managed_process import ManagedProcess
 
-    async def status(sandbox_id):
-        return {"state": "running"}
+    pending = list(states)
+    asked: list[str] = []
 
-    client = SimpleNamespace(get_sandbox_status=status)
+    async def status(sandbox_id):
+        asked.append(sandbox_id)
+        return {"state": pending.pop(0) if pending else "running"}
+
+    client = SimpleNamespace(get_sandbox_status=status, asked=asked)
     runtime = SimpleNamespace(_client_or_raise=lambda: client, **runtime_attrs)
     return ManagedProcess(runtime, job, "/tmp/mailbox")
 
 
-@pytest.mark.asyncio
-async def test_a_waiting_process_is_polled_without_reading_its_log(monkeypatch) -> None:
+_real_sleep = asyncio.sleep
+
+
+class _Gateway:
+    """A managed job behind a gateway whose log reads carry the job's record and
+    are held until there is output (0.9.72). Each held stdout read that finds
+    nothing new is answered after the next scripted step of the job."""
+
+    def __init__(self, *steps, carries_record: bool = True) -> None:
+        self.out, self.err = bytearray(), bytearray()
+        self.terminal, self.exit_code, self.truncated = False, None, False
+        self.steps, self.carries_record = list(steps), carries_record
+        self.reads: list[tuple[str, int, float | None]] = []
+        self.errors: list[BaseException] = []
+        self.retry_after: float | None = None
+        self.inflight = self.most_inflight = self.refreshes = 0
+        self.job = SimpleNamespace(
+            sandbox_id="sandbox",
+            job_id="job",
+            client=self,
+            record=self.record(),
+            refresh=self.refresh,
+        )
+
+    def record(self):
+        return SimpleNamespace(
+            terminal=self.terminal,
+            exit_code=self.exit_code,
+            stdout_bytes=len(self.out),
+            stderr_bytes=len(self.err),
+            stdout_truncated=self.truncated,
+            stderr_truncated=False,
+        )
+
+    async def refresh(self):
+        self.refreshes += 1
+        return self.record()
+
+    async def _read_job_log_chunk(
+        self, sandbox_id, job_id, *, stream, offset, limit, wait_seconds
+    ):
+        self.inflight += 1
+        self.most_inflight = max(self.most_inflight, self.inflight)
+        try:
+            await _real_sleep(0)  # lets any concurrent read show itself
+            self.reads.append((stream, offset, wait_seconds))
+            if self.errors:
+                raise self.errors.pop(0)
+            log = self.out if stream == "stdout" else self.err
+            held = wait_seconds is not None and stream == "stdout"
+            if held and offset >= len(log) and not self.terminal and self.steps:
+                self.steps.pop(0)(self)
+            data = bytes(log[offset : offset + limit])
+            chunk = SimpleNamespace(
+                data=data,
+                next_offset=offset + len(data),
+                eof=self.terminal,
+                job=self.record() if self.carries_record else None,
+            )
+            return SimpleNamespace(chunk=chunk, retry_after=self.retry_after)
+        finally:
+            self.inflight -= 1
+
+
+def _step(out=b"", err=b"", exit_code=None, truncated=False):
+    def step(gateway: _Gateway) -> None:
+        gateway.out += out
+        gateway.err += err
+        gateway.truncated = truncated
+        if exit_code is not None:
+            gateway.terminal, gateway.exit_code = True, exit_code
+
+    return step
+
+
+@pytest.fixture
+def sleeps(monkeypatch):
+    """The managed process's pauses, recorded instead of slept."""
     import verifiers_ucloud.managed_process as managed
 
-    monkeypatch.setattr(managed, "_POLL_SECONDS", 0)
+    slept: list[float] = []
+
+    async def sleep(delay):
+        slept.append(delay)
+        await _real_sleep(0)
+
+    monkeypatch.setattr(managed.asyncio, "sleep", sleep)
+    return slept
+
+
+async def _drain(process):
+    stdout, stderr, code = await asyncio.gather(
+        _joined(process.stdout), _joined(process.stderr), process.wait()
+    )
+    return stdout, stderr, code
+
+
+async def _joined(stream) -> bytes:
+    return b"".join([chunk async for chunk in stream])
+
+
+@pytest.mark.asyncio
+async def test_a_process_is_followed_through_one_held_read(sleeps) -> None:
+    gateway = _Gateway(
+        _step(out=b"hello "),
+        _step(),  # a model call: the held read times out empty
+        _step(out=b"world"),
+        _step(exit_code=0),
+    )
+    process = _managed_process(gateway.job)
+    assert await _drain(process) == (b"hello world", b"", 0)
+    # Never more than one request in flight, and every one a held stdout read:
+    # no status reads, no stderr reads (it never grew), no sandbox status.
+    assert gateway.most_inflight == 1
+    assert gateway.refreshes == 0
+    assert gateway.reads == [
+        ("stdout", 0, 20.0),
+        ("stdout", 6, 20.0),
+        ("stdout", 6, 20.0),
+        ("stdout", 11, 20.0),
+    ]
+    assert process.runtime._client_or_raise().asked == []
+    # A held read that came back at once without output is paced (the fake
+    # answers instantly), and one with output is followed at once.
+    assert sleeps == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_stderr_is_read_only_when_its_record_shows_it_grew(sleeps) -> None:
+    gateway = _Gateway(
+        _step(out=b"a"),
+        _step(out=b"b", err=b"warn "),
+        _step(out=b"c"),
+        _step(err=b"more"),
+        _step(out=b"d", exit_code=3),
+    )
+    process = _managed_process(gateway.job)
+    assert await _drain(process) == (b"abcd", b"warn more", 3)
+    stderr = [read for read in gateway.reads if read[0] == "stderr"]
+    # Read at once (never held), and only from the offsets where it grew.
+    assert stderr == [("stderr", 0, None), ("stderr", 5, None)]
+    assert gateway.most_inflight == 1 and gateway.refreshes == 0
+
+
+@pytest.mark.asyncio
+async def test_the_terminal_record_answers_wait_without_reading_output(sleeps) -> None:
+    gateway = _Gateway(_step(out=b"x" * 10, err=b"e"), _step(), _step(exit_code=9))
+    process = _managed_process(gateway.job)
+    # Nobody reads the streams: wait() alone starts the follower.
+    assert await process.wait() == 9
+    assert await process.wait() == 9  # answered again without a request
+    reads = len(gateway.reads)
+    assert await _joined(process.stdout) == b"x" * 10
+    assert await _joined(process.stderr) == b"e"
+    assert len(gateway.reads) == reads
+    # A caller's timeout on wait() leaves the follower running.
+    other = _managed_process(_Gateway(_step(), _step(exit_code=0)).job)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(other.wait(), 0)
+    assert await other.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_large_terminal_log_is_read_page_by_page(monkeypatch, sleeps) -> None:
+    import verifiers_ucloud.managed_process as managed
+    import verifiers_ucloud.recovery as recovery
+
+    monkeypatch.setattr(managed, "LOG_PAGE_BYTES", 4)
+    monkeypatch.setattr(recovery, "LOG_PAGE_BYTES", 4)
+    gateway = _Gateway(_step(out=b"0123456789", exit_code=0))
+    process = _managed_process(gateway.job)
+    assert await _drain(process) == (b"0123456789", b"", 0)
+    assert [offset for _, offset, _ in gateway.reads] == [0, 4, 8]
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_bytes_of_a_parked_sandbox_wait_until_it_runs(sleeps) -> None:
+    from ucloud_sandboxes_sdk import SandboxApiError
+
+    gateway = _Gateway(_step(), _step(exit_code=0))
+    # The last record (here the start's) shows bytes the parked image still holds.
+    gateway.out += b"before park"
+    gateway.job.record = gateway.record()
+    process = _managed_process(gateway.job, states=["parked", "unparking"])
+    gateway.errors.append(
+        SandboxApiError(
+            "sandbox lifecycle transition is in progress", status_code=400, body={}
+        )
+    )
+    assert await _drain(process) == (b"before park", b"", 0)
+    # Two parked/unparking answers and one refused read, each 2 s apart; the
+    # bytes are read only once the sandbox runs.
+    assert sleeps[:3] == [2, 2, 2]
+    assert gateway.reads[:2] == [("stdout", 0, 20.0), ("stdout", 0, 20.0)]
+    assert len(process.runtime._client_or_raise().asked) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_parked_answer_is_paced_by_its_retry_after(sleeps) -> None:
+    gateway = _Gateway(_step(), _step(exit_code=0))
+    gateway.retry_after = 3.0
+    process = _managed_process(gateway.job)
+    assert await _drain(process) == (b"", b"", 0)
+    assert sleeps == [3.0]
+
+
+@pytest.mark.asyncio
+async def test_truncated_output_fails_the_streams_and_wait(sleeps) -> None:
+    gateway = _Gateway(_step(out=b"partial", truncated=True), _step(exit_code=0))
+    process = _managed_process(gateway.job)
+    with pytest.raises(SandboxError, match="output truncated"):
+        await _joined(process.stdout)
+    with pytest.raises(SandboxError, match="output truncated"):
+        await _joined(process.stderr)
+    with pytest.raises(SandboxError, match="output truncated"):
+        await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_an_older_gateway_is_polled_without_reading_its_log(sleeps) -> None:
     log = b"first|last reply"
     # stdout byte counts the job status answers, poll by poll: output, a long wait
     # (the model call), then the last reply written just before the job ends.
     timeline = [(6, False), (6, False), (6, False), (6, False), (16, False), (16, True)]
+    gateway = _Gateway(carries_record=False)
 
-    class Job:
-        sandbox_id, job_id = "sandbox", "job"
+    async def refresh():
+        size, terminal = timeline[min(gateway.refreshes, len(timeline) - 1)]
+        gateway.refreshes += 1
+        gateway.out[:] = log[:size]
+        gateway.terminal, gateway.exit_code = terminal, 0 if terminal else None
+        return gateway.record()
 
-        def __init__(self) -> None:
-            self.polls, self.reads = 0, []
+    gateway.job.refresh = refresh
+    process = _managed_process(gateway.job)
+    assert await _drain(process) == (log, b"", 0)
+    # One probing read (held, ignored by this gateway, carrying no record); then
+    # the log, whose reads wake the sandbox there, only when the status grew,
+    # and one status poll a second for both streams and wait().
+    assert gateway.reads == [
+        ("stdout", 0, 20.0),
+        ("stdout", 0, None),
+        ("stdout", 6, None),
+    ]
+    assert gateway.refreshes == len(timeline)
+    assert sleeps == [1.0] * (len(timeline) - 1)
 
-        async def refresh(self):
-            size, terminal = timeline[min(self.polls, len(timeline) - 1)]
-            self.polls += 1
-            return SimpleNamespace(
-                terminal=terminal,
-                stdout_bytes=size,
-                stderr_bytes=0,
-                stdout_truncated=False,
-                stderr_truncated=False,
-            )
 
-        async def logs(self, stream, *, offset=0):
-            self.reads.append(offset)
-            end = timeline[min(self.polls, len(timeline)) - 1][0]
-            return SimpleNamespace(data=log[offset:end], next_offset=end, eof=True)
+@pytest.mark.asyncio
+async def test_followed_reads_recover_within_the_window(monkeypatch, sleeps) -> None:
+    import verifiers_ucloud.recovery as recovery
 
-    job = Job()
-    process = _managed_process(job)
-    assert b"".join([chunk async for chunk in process.stdout]) == log
-    # The log (a waking read) was read only when the status showed new bytes.
-    assert job.reads == [0, 6]
-    assert job.polls == len(timeline)
+    def clock(*times):
+        ticks = iter(times)
+        monkeypatch.setattr(
+            recovery, "time", SimpleNamespace(monotonic=lambda: next(ticks))
+        )
+
+    # Failures 0 and 100 s into a run: within 120 s, so the read is repeated.
+    clock(0.0, 100.0)
+    gateway = _Gateway(_step(out=b"ok"), _step(exit_code=0))
+    gateway.errors += [_unreachable(), _unreachable()]
+    process = _managed_process(gateway.job)
+    assert await _drain(process) == (b"ok", b"", 0)
+    assert sleeps[:2] == [1.0, 1.0]
+
+    # Past the window, the read fails the process and its streams.
+    clock(0.0, 50.0, 100.0, 150.0)
+    gateway = _Gateway(_step(exit_code=0))
+    gateway.errors += [_unreachable()] * 4
+    process = _managed_process(gateway.job)
+    with pytest.raises(SandboxError, match=r"stdout read failed.*heartbeat"):
+        await process.wait()
+    with pytest.raises(SandboxError, match="heartbeat"):
+        await _joined(process.stderr)
+    assert len(gateway.reads) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_lost_node_ends_a_followed_process(sleeps) -> None:
+    from ucloud_sandboxes_sdk import SandboxApiError
+
+    from verifiers_ucloud.recovery import SandboxNodeLost
+
+    gateway = _Gateway(_step(exit_code=0))
+    gateway.errors.append(
+        SandboxApiError("gone", status_code=410, body={"error_code": "node_lost"})
+    )
+    process = _managed_process(gateway.job)
+    with pytest.raises(SandboxNodeLost):
+        await process.wait()
+    with pytest.raises(SandboxNodeLost):
+        await _joined(process.stdout)
+    assert len(gateway.reads) == 1
 
 
 @pytest.mark.asyncio

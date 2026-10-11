@@ -5,15 +5,15 @@ UCloud sandbox runtime and relay-backed interception for verifiers v1.
 ## Install (this is the one thing a client needs)
 
 ```console
-uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.6"
+uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.7"
 ```
 
 That tag pins everything else:
 
 | Package | Version | From |
 |---|---|---|
-| `verifiers-ucloud` | 0.3.6 | this repository, tag `v0.3.6` |
-| `ucloud-sandboxes-sdk` | 0.4.38 | [release wheel](https://github.com/rlrs/ucloud-sandboxes-sdk/releases/tag/v0.4.38) |
+| `verifiers-ucloud` | 0.3.7 | this repository, tag `v0.3.7` |
+| `ucloud-sandboxes-sdk` | 0.4.39 | [release wheel](https://github.com/rlrs/ucloud-sandboxes-sdk/releases/tag/v0.4.39) |
 | `verifiers` | 0.3.1.post1: upstream `main` of 2026-09-08 plus the runtime-provider hooks and the LUMI RL harnesses | [`rlrs/verifiers` tag `v0.3.1.post1`](https://github.com/rlrs/verifiers/releases/tag/v0.3.1.post1) |
 
 Do not install `ucloud-sandboxes-sdk` or `verifiers` separately, and do not use
@@ -131,6 +131,13 @@ one managed primary process per sandbox, even after it exits: the first `run_pro
 `open_process` gets it, and later ones (an ACP process restarted after a failed turn) run
 as live execs, which keep the sandbox resident.
 
+A managed process or program is followed, not polled (gateway 0.9.72): one follower task
+per interactive process holds a stdout log read at the gateway until there is output,
+reads stderr only when the record carried by a read shows it grew, and answers `wait()`
+from the terminal record; `run_program` waits through held status reads. Neither wakes a
+paused or parked sandbox. Older gateways, which answer at once, are polled: once a second
+per interactive process, every `agent_poll_seconds` for `run_program`.
+
 `image_reference_type = "name"` sends `image` as a gateway image name instead of a
 registry reference: name an image recipe registered with the SDK's
 `register_image_recipes`, and the sandbox waits for its build.
@@ -151,7 +158,7 @@ interception's host tunnel).
 raises `SandboxNodeLost` (a `SandboxError`) from creation, execs, file transfers and
 managed processes, so a trainer can retry the episode on a fresh sandbox; teardown only
 logs it. Managed jobs are never restarted: answers the gateway marks retryable (a node's
-briefly stale heartbeat) are polled again for 120 s and transient log reads retry at the
+briefly stale heartbeat) are read again for 120 s and transient log reads retry at the
 same offset; truncated output is an error. A cancelled program gets SIGTERM (the gateway
 refuses SIGKILL for managed jobs) and the sandbox's deletion ends whatever ignores it. A
 lost response acknowledgement is re-sent with the same bytes rather than regenerated. A
