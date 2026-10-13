@@ -147,7 +147,8 @@ class UCloudRuntimeConfig(NetworkPolicyConfig):
     harness_toolkit: str | None = None
     """The toolkit (one of ``toolkits``, by name) holding the harness assets,
     installed: its ``vf-*`` trees are linked to ``/var/tmp/vf-*``, where the
-    harnesses find themselves already installed. Nothing is copied into the
+    harnesses find themselves already installed, and its ``links`` file's paths
+    (Prime Agent's kernel venv) to theirs. Nothing is copied into the
     sandbox. Built by `runtime/toolkits/vf-agents/build.sh` in `ucloud-sandboxes`."""
     park_interactive: bool = False
     """Run live processes (`open_process`, e.g. an ACP agent) as managed jobs too,

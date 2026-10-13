@@ -5,14 +5,14 @@ UCloud sandbox runtime and relay-backed interception for verifiers v1.
 ## Install (this is the one thing a client needs)
 
 ```console
-uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.7"
+uv add "verifiers-ucloud @ git+https://github.com/rlrs/verifiers-ucloud@v0.3.8"
 ```
 
 That tag pins everything else:
 
 | Package | Version | From |
 |---|---|---|
-| `verifiers-ucloud` | 0.3.7 | this repository, tag `v0.3.7` |
+| `verifiers-ucloud` | 0.3.8 | this repository, tag `v0.3.8` |
 | `ucloud-sandboxes-sdk` | 0.4.39 | [release wheel](https://github.com/rlrs/ucloud-sandboxes-sdk/releases/tag/v0.4.39) |
 | `verifiers` | 0.3.1.post1: upstream `main` of 2026-09-08 plus the runtime-provider hooks and the LUMI RL harnesses | [`rlrs/verifiers` tag `v0.3.1.post1`](https://github.com/rlrs/verifiers/releases/tag/v0.3.1.post1) |
 
@@ -171,9 +171,10 @@ default). A managed sandbox's /tmp is a tmpfs of half its memory (`tmp_mb`), not
 gateway's 64 MiB default: graders install uv and packages there.
 
 `harness_toolkit = "vf-agents"` (with `toolkits = ["vf-agents:latest"]`) takes the harness
-assets (Node, Pi, OpenCode) from a read-only toolkit instead of `offline_harness_bundle`: their
-`vf-*` trees are linked to `/var/tmp/vf-*`, already installed, so nothing is copied into the
-sandbox. A bundle writes its archive and its unpacked tree (0.5-0.7 GB) to every sandbox's
+assets (Node, Pi, OpenCode, Prime Agent) from a read-only toolkit instead of
+`offline_harness_bundle`: their `vf-*` trees are linked to `/var/tmp/vf-*`, already installed,
+and Prime Agent's Python kernel to `/root/.prime/agent/kernel-venv` (the toolkit's `links`), so
+nothing is copied into the sandbox. A bundle writes its archive and its unpacked tree (0.5-0.7 GB) to every sandbox's
 disk in one burst, which can outrun the sandbox's disk growth (`No space left on device`).
 The toolkit is built from the bundles by `runtime/toolkits/vf-agents/build.sh` in
 `ucloud-sandboxes`.

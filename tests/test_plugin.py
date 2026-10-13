@@ -672,6 +672,20 @@ async def test_a_harness_toolkit_links_its_trees_instead_of_uploading(
     assert run().returncode == 0
     assert os.readlink(tmp_path / "var-tmp/vf-pi") == str(toolkit / "vf-pi")
     assert run().returncode == 0  # Idempotent.
+    # The toolkit's links: Prime Agent's kernel venv, under a home the image lacks.
+    (toolkit / "vf-prime-kernel/kernel-venv").mkdir(parents=True)
+    kernel = tmp_path / "root/.prime/agent/kernel-venv"
+    target = tmp_path / "var-tmp/vf-prime-kernel/kernel-venv"
+    (toolkit / "links").write_text(f"{kernel} {target}\n")
+    assert run().returncode == 0
+    assert os.readlink(kernel) == str(target)
+    assert kernel.resolve() == (toolkit / "vf-prime-kernel/kernel-venv").resolve()
+    assert run().returncode == 0  # Idempotent.
+    kernel.unlink()
+    kernel.mkdir()
+    refused = run()
+    assert refused.returncode == 1 and "kernel-venv already exists" in refused.stderr
+    kernel.rmdir()
     (tmp_path / "var-tmp/vf-node").unlink()
     (tmp_path / "var-tmp/vf-node").mkdir()
     refused = run()

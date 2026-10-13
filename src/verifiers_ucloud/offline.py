@@ -130,8 +130,10 @@ def read_harness_bundle(path: str) -> tuple[bytes, dict]:
     return blob, manifest
 
 
-# Each vf-* tree of the toolkit at /var/tmp/vf-*, where the harnesses install them.
-# A link already there is replaced; an image's own directory there is refused.
+# Each vf-* tree of the toolkit at /var/tmp/vf-*, where the harnesses install them,
+# then each "LINK TARGET" line of the toolkit's `links` (Prime Agent's kernel venv
+# at /root/.prime/agent/kernel-venv). A link already there is replaced; an image's
+# own file or directory there is refused.
 _LINK_HARNESS_TREES = r"""
 set -eu
 toolkit=$1
@@ -150,6 +152,15 @@ for tree in "$toolkit"/vf-*; do
     linked=$((linked + 1))
 done
 [ "$linked" -gt 0 ] || { echo "$toolkit holds no vf-* trees" >&2; exit 1; }
+[ -f "$toolkit/links" ] || exit 0
+while read -r link target; do
+    [ -n "$link" ] || continue
+    if [ -e "$link" ] && [ ! -L "$link" ]; then
+        echo "$link already exists in the image" >&2; exit 1
+    fi
+    mkdir -p "$(dirname "$link")"
+    ln -sfn "$target" "$link"
+done < "$toolkit/links"
 """
 
 
